@@ -1,5 +1,13 @@
 # Rust build output
 /target/
+/src-tauri/target/
+/src-tauri/gen/schemas/
+
+# Frontend / Tauri JS artifacts
+/node_modules/
+/app/node_modules/
+/app/dist/
+/app/dist-ssr/
 
 # Local compas runtime artifacts
 /.compas/
