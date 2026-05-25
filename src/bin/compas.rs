@@ -5,13 +5,19 @@ use compas::{
         dart::extract_semantic_references, extract_calls_for_language, language_for_path,
         ChunkerRegistry,
     },
-    code::{graph::Graph, models::CodeChunk, CodeRuntime},
+    code::{
+        graph::Graph,
+        models::{CodeChunk, CodeSearchResult},
+        ranking::rerank_code_results,
+        CodeRuntime,
+    },
     config::AppConfig,
-    docs::indexing::DocumentIndexAdapter,
+    docs::{indexing::DocumentIndexAdapter, models::DocumentSearchResult},
     embedder::build_embedder,
     indexing::{Indexer, IndexingAdapter},
     mcp::{self, state::McpAppState},
     models::IndexedChunk,
+    search::search_chunks,
     server::{router, AppState, RepoState},
     store::{edge::EdgeStore, Store},
     watcher::{FileWatcher, Handler},
@@ -151,7 +157,21 @@ enum Commands {
     /// Initialize compas.yaml for the current repository
     Init,
     /// Index the repository
-    Index,
+    Index {
+        /// Optional folder to index directly in document mode
+        path: Option<PathBuf>,
+    },
+    /// Search the local index
+    Search {
+        /// Natural language search query
+        query: String,
+        /// Optional folder whose local .compas index should be searched
+        #[arg(long)]
+        path: Option<PathBuf>,
+        /// Maximum number of results to return
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+    },
     /// Optimize the local edge shard
     Optimize,
     /// Start the HTTP daemon for REST, eval scripts, and multi-repo access
@@ -171,15 +191,191 @@ async fn main() -> anyhow::Result<()> {
         Commands::Init => init_repo(),
         Commands::Serve => serve().await,
         Commands::Mcp => run_mcp().await,
-        cmd => {
-            let config = AppConfig::load(cli.config.to_str().unwrap())?;
-            match cmd {
-                Commands::Index => index_repo(config).await,
-                Commands::Optimize => optimize_repo(config).await,
-                Commands::Watch => watch(config).await,
-                Commands::Init | Commands::Serve | Commands::Mcp => unreachable!(),
-            }
+        Commands::Index { path } => {
+            let config = load_command_config(&cli.config, path.as_deref())?;
+            index_repo(config).await
         }
+        Commands::Search { query, path, limit } => {
+            let config = load_command_config(&cli.config, path.as_deref())?;
+            println!("{}", search_repo(config, &query, limit).await?);
+            Ok(())
+        }
+        Commands::Optimize => {
+            let config = AppConfig::load(cli.config.to_str().unwrap())?;
+            optimize_repo(config).await
+        }
+        Commands::Watch => {
+            let config = AppConfig::load(cli.config.to_str().unwrap())?;
+            watch(config).await
+        }
+    }
+}
+
+fn load_command_config(
+    config_path: &Path,
+    path_override: Option<&Path>,
+) -> anyhow::Result<AppConfig> {
+    let mut config = if config_path.exists() {
+        AppConfig::load(config_path.to_str().unwrap())?
+    } else if let Some(path) = path_override {
+        default_document_config(path)
+    } else {
+        return Err(anyhow::anyhow!(
+            "config file '{}' not found",
+            config_path.display()
+        ));
+    };
+
+    if let Some(path) = path_override {
+        config.repo.path = path.to_string_lossy().to_string();
+    }
+
+    Ok(config)
+}
+
+fn default_document_config(path: &Path) -> AppConfig {
+    AppConfig {
+        repo: compas::config::RepoConfig {
+            path: path.to_string_lossy().to_string(),
+            include: vec!["**/*.md".into(), "**/*.txt".into(), "**/*.pdf".into()],
+            exclude: vec![],
+        },
+        embedder: compas::config::EmbedderConfig {
+            provider: "fastembed".into(),
+            model: "nomic-ai/nomic-embed-text-v1.5".into(),
+            query_prefix: None,
+            doc_prefix: None,
+        },
+        store: compas::config::StoreConfig {
+            provider: "edge".into(),
+            path: ".compas/edge-shard".into(),
+            vector_name: "default".into(),
+        },
+        server: compas::config::ServerConfig {
+            host: "127.0.0.1".into(),
+            port: "3001".into(),
+        },
+        index: compas::config::IndexConfig {
+            kind: "document".into(),
+            chunk_by: "function".into(),
+            watch: false,
+        },
+    }
+}
+
+async fn search_repo(config: AppConfig, query: &str, limit: usize) -> anyhow::Result<String> {
+    let embedder = build_embedder(&config.embedder)?;
+    let repo_path = std::fs::canonicalize(&config.repo.path)?;
+    let store = EdgeStore::new(
+        repo_path.join(&config.store.path),
+        &config.store.vector_name,
+    );
+    let raw_results = search_chunks(
+        embedder.as_ref(),
+        &store,
+        query,
+        if config.index.kind == "code" {
+            limit * 3
+        } else {
+            limit
+        },
+        &HashMap::new(),
+    )
+    .await?;
+
+    match config.index.kind.as_str() {
+        "code" => {
+            let graph = Arc::new(Graph::new());
+            let graph_path = repo_path.join(".compas").join("graph.json");
+            if let Err(error) = graph.load(&graph_path) {
+                debug!("no existing graph to load for search: {}", error);
+            }
+
+            let results = rerank_code_results(graph.as_ref(), raw_results, query, limit);
+            Ok(format_code_search_results(&results, &repo_path))
+        }
+        "document" => {
+            let results = raw_results
+                .into_iter()
+                .map(DocumentSearchResult::try_from)
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            Ok(format_document_search_results(&results, &repo_path))
+        }
+        other => Err(anyhow::anyhow!(
+            "unsupported index.kind '{}' ; expected 'code' or 'document'",
+            other
+        )),
+    }
+}
+
+fn format_code_search_results(results: &[CodeSearchResult], repo_path: &Path) -> String {
+    if results.is_empty() {
+        return "No relevant code found.".to_string();
+    }
+
+    let mut lines = vec![format!("Found {} relevant code result(s):", results.len())];
+    for (index, result) in results.iter().enumerate() {
+        let rel_path = Path::new(&result.chunk.file_path)
+            .strip_prefix(repo_path)
+            .map(|path| path.to_string_lossy().to_string())
+            .unwrap_or_else(|_| result.chunk.file_path.clone());
+        let preview: String = result.chunk.content.chars().take(240).collect();
+
+        lines.push(format!(
+            "\n{}. {}:{}-{}\n   Symbol: {}\n   Score: {:.3}\n   Preview: {}",
+            index + 1,
+            rel_path,
+            result.chunk.line_start,
+            result.chunk.line_end,
+            result.chunk.symbol,
+            result.score,
+            preview
+        ));
+    }
+
+    lines.join("\n")
+}
+
+fn format_document_search_results(results: &[DocumentSearchResult], repo_path: &Path) -> String {
+    if results.is_empty() {
+        return "No relevant documents found.".to_string();
+    }
+
+    let mut lines = vec![format!(
+        "Found {} relevant document result(s):",
+        results.len()
+    )];
+    for (index, result) in results.iter().enumerate() {
+        let rel_path = Path::new(&result.chunk.file_path)
+            .strip_prefix(repo_path)
+            .map(|path| path.to_string_lossy().to_string())
+            .unwrap_or_else(|_| result.chunk.file_path.clone());
+        let section = if result.chunk.heading_path.is_empty() {
+            "(root)".to_string()
+        } else {
+            result.chunk.heading_path.join(" > ")
+        };
+
+        lines.push(format!(
+            "\n{}. {}\n   Title: {}\n   Section: {}\n   Page: {}\n   Score: {:.3}\n   Preview: {}",
+            index + 1,
+            rel_path,
+            result.chunk.title,
+            section,
+            display_page_range(result.chunk.page_start, result.chunk.page_end),
+            result.score,
+            result.chunk.preview
+        ));
+    }
+
+    lines.join("\n")
+}
+
+fn display_page_range(page_start: Option<usize>, page_end: Option<usize>) -> String {
+    match (page_start, page_end) {
+        (Some(start), Some(end)) if start != end => format!("{}-{}", start, end),
+        (Some(start), _) => start.to_string(),
+        _ => "n/a".to_string(),
     }
 }
 
@@ -2281,6 +2477,52 @@ index:
             error.to_string(),
             "document watch mode is not implemented yet"
         );
+
+        std::fs::remove_dir_all(&repo_dir).unwrap();
+    }
+
+    #[test]
+    fn test_load_command_config_builds_default_document_mode_for_folder_override() {
+        let repo_dir = unique_temp_path("document-default-config");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+
+        let config = load_command_config(&repo_dir.join("missing.yaml"), Some(&repo_dir)).unwrap();
+
+        assert_eq!(config.index.kind, "document");
+        assert_eq!(config.repo.path, repo_dir.to_string_lossy());
+        assert_eq!(config.repo.include, vec!["**/*.md", "**/*.txt", "**/*.pdf"]);
+
+        std::fs::remove_dir_all(&repo_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_search_repo_returns_document_results_for_folder_mode() {
+        let _guard = test_lock().lock().unwrap();
+
+        let repo_dir = unique_temp_path("document-search");
+        std::fs::create_dir_all(repo_dir.join("docs")).unwrap();
+        std::fs::write(
+            repo_dir.join("docs").join("policy.md"),
+            "# Insurance Policy\n\nRenewal date is January 15.\n",
+        )
+        .unwrap();
+
+        let mut config = default_document_config(&repo_dir);
+        config.embedder.provider = "test".into();
+        config.embedder.model = "test".into();
+
+        let _cwd_guard = CurrentDirGuard::set(&repo_dir);
+        index_repo(config.clone()).await.unwrap();
+
+        let output = search_repo(config, "renewal date", 5).await.unwrap();
+
+        assert!(
+            output.contains("Found 1 relevant document result"),
+            "{output}"
+        );
+        assert!(output.contains("policy.md"), "{output}");
+        assert!(output.contains("Page: n/a"), "{output}");
+        assert!(output.contains("Renewal date is January 15."), "{output}");
 
         std::fs::remove_dir_all(&repo_dir).unwrap();
     }

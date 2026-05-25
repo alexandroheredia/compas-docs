@@ -19,3 +19,4 @@
 # Common editor settings
 .idea/
 .vscode/
+/tests
