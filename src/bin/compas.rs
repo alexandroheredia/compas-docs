@@ -13,6 +13,11 @@ use compas::{
     },
     config::AppConfig,
     docs::{indexing::DocumentIndexAdapter, models::DocumentSearchResult},
+    docs_backend::{
+        add_folder, default_document_config, document_storage_paths, index_folder, list_folders,
+        normalize_document_storage, open_document, remove_folder, resolved_store_path,
+        reveal_in_finder, search_documents,
+    },
     embedder::build_embedder,
     indexing::{Indexer, IndexingAdapter},
     mcp::{self, state::McpAppState},
@@ -172,6 +177,16 @@ enum Commands {
         #[arg(long, default_value_t = 10)]
         limit: usize,
     },
+    /// Add a folder to the central document library
+    AddFolder { path: PathBuf },
+    /// List registered document folders
+    ListFolders,
+    /// Remove a folder from the central document library
+    RemoveFolder { id: String },
+    /// Open a file with the default app
+    Open { path: PathBuf },
+    /// Reveal a file in Finder
+    Reveal { path: PathBuf },
     /// Optimize the local edge shard
     Optimize,
     /// Start the HTTP daemon for REST, eval scripts, and multi-repo access
@@ -193,13 +208,54 @@ async fn main() -> anyhow::Result<()> {
         Commands::Mcp => run_mcp().await,
         Commands::Index { path } => {
             let config = load_command_config(&cli.config, path.as_deref())?;
-            index_repo(config).await
+            if config.index.kind == "document" {
+                let target_path = path.unwrap_or_else(|| PathBuf::from(&config.repo.path));
+                index_folder(&target_path, config).await?;
+                Ok(())
+            } else {
+                index_repo(config).await
+            }
         }
         Commands::Search { query, path, limit } => {
             let config = load_command_config(&cli.config, path.as_deref())?;
-            println!("{}", search_repo(config, &query, limit).await?);
+            if config.index.kind == "document" && path.is_none() {
+                for result in search_documents(&query, None, limit, config).await? {
+                    println!(
+                        "{}\n  Title: {}\n  Section: {}\n  Page: {}\n  Score: {:.3}\n  Preview: {}\n",
+                        result.file_path,
+                        result.title,
+                        result.section,
+                        result.page,
+                        result.score,
+                        result.preview
+                    );
+                }
+            } else {
+                println!("{}", search_repo(config, &query, limit).await?);
+            }
             Ok(())
         }
+        Commands::AddFolder { path } => {
+            let record = add_folder(&path)?;
+            println!("Added folder '{}' ({})", record.display_name, record.id);
+            Ok(())
+        }
+        Commands::ListFolders => {
+            for folder in list_folders() {
+                println!("{}  {}  {}", folder.id, folder.display_name, folder.path);
+            }
+            Ok(())
+        }
+        Commands::RemoveFolder { id } => {
+            if remove_folder(&id)? {
+                println!("Removed folder {}", id);
+            } else {
+                println!("Folder {} not found", id);
+            }
+            Ok(())
+        }
+        Commands::Open { path } => open_document(&path),
+        Commands::Reveal { path } => reveal_in_finder(&path),
         Commands::Optimize => {
             let config = AppConfig::load(cli.config.to_str().unwrap())?;
             optimize_repo(config).await
@@ -230,44 +286,16 @@ fn load_command_config(
         config.repo.path = path.to_string_lossy().to_string();
     }
 
-    Ok(config)
-}
+    normalize_document_storage(&mut config);
 
-fn default_document_config(path: &Path) -> AppConfig {
-    AppConfig {
-        repo: compas::config::RepoConfig {
-            path: path.to_string_lossy().to_string(),
-            include: vec!["**/*.md".into(), "**/*.txt".into(), "**/*.pdf".into()],
-            exclude: vec![],
-        },
-        embedder: compas::config::EmbedderConfig {
-            provider: "fastembed".into(),
-            model: "nomic-ai/nomic-embed-text-v1.5".into(),
-            query_prefix: None,
-            doc_prefix: None,
-        },
-        store: compas::config::StoreConfig {
-            provider: "edge".into(),
-            path: ".compas/edge-shard".into(),
-            vector_name: "default".into(),
-        },
-        server: compas::config::ServerConfig {
-            host: "127.0.0.1".into(),
-            port: "3001".into(),
-        },
-        index: compas::config::IndexConfig {
-            kind: "document".into(),
-            chunk_by: "function".into(),
-            watch: false,
-        },
-    }
+    Ok(config)
 }
 
 async fn search_repo(config: AppConfig, query: &str, limit: usize) -> anyhow::Result<String> {
     let embedder = build_embedder(&config.embedder)?;
     let repo_path = std::fs::canonicalize(&config.repo.path)?;
     let store = EdgeStore::new(
-        repo_path.join(&config.store.path),
+        resolved_store_path(&config, &repo_path),
         &config.store.vector_name,
     );
     let raw_results = search_chunks(
@@ -1209,12 +1237,13 @@ async fn index_repo(config: AppConfig) -> anyhow::Result<()> {
     let embedder = build_embedder(&config.embedder)?;
     let repo_path = std::fs::canonicalize(&config.repo.path)?;
     let store = Arc::new(EdgeStore::new(
-        repo_path.join(&config.store.path),
+        resolved_store_path(&config, &repo_path),
         &config.store.vector_name,
     ));
     store.init(embedder.dimensions()).await?;
 
     if config.index.kind == "document" {
+        let storage = document_storage_paths(&repo_path);
         let adapter = DocumentIndexAdapter::new();
         let indexer = Indexer::new(
             &repo_path,
@@ -1222,7 +1251,8 @@ async fn index_repo(config: AppConfig) -> anyhow::Result<()> {
             &config.repo.exclude,
             store.as_ref(),
             embedder.as_ref(),
-        );
+        )
+        .with_manifest_path(&storage.manifest_path);
         let report = indexer.index_repo(&adapter).await?;
 
         print_index_summary(&repo_path, &report, None, None);
@@ -1394,7 +1424,7 @@ async fn optimize_repo(config: AppConfig) -> anyhow::Result<()> {
 fn optimize_edge_shard(config: &AppConfig) -> anyhow::Result<bool> {
     let repo_path = std::fs::canonicalize(&config.repo.path)?;
     let store = EdgeStore::new(
-        repo_path.join(&config.store.path),
+        resolved_store_path(config, &repo_path),
         &config.store.vector_name,
     );
     store.optimize()
@@ -1441,7 +1471,7 @@ async fn run_mcp() -> anyhow::Result<()> {
             }
         };
         let edge_store = Arc::new(EdgeStore::new(
-            repo_path.join(&config.store.path),
+            resolved_store_path(&config, &repo_path),
             &config.store.vector_name,
         ));
         // MCP startup only loads repo descriptors. The shard is opened on demand
@@ -1529,7 +1559,7 @@ async fn serve() -> anyhow::Result<()> {
             }
         };
         let edge_store = Arc::new(EdgeStore::new(
-            repo_path.join(&config.store.path),
+            resolved_store_path(&config, &repo_path),
             &config.store.vector_name,
         ));
         // Daemon startup only loads repo descriptors. The shard is opened on
@@ -1618,7 +1648,7 @@ async fn watch(config: AppConfig) -> anyhow::Result<()> {
     let repo_path = std::fs::canonicalize(&config.repo.path)?;
     let embedder = build_embedder(&config.embedder)?;
     let edge_store = Arc::new(EdgeStore::new(
-        repo_path.join(&config.store.path),
+        resolved_store_path(&config, &repo_path),
         &config.store.vector_name,
     ));
     edge_store.init(embedder.dimensions()).await?;
@@ -1908,6 +1938,13 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(()))
     }
 
+    fn lock_tests() -> std::sync::MutexGuard<'static, ()> {
+        match test_lock().lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
     fn unique_temp_path(name: &str) -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -2187,7 +2224,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_init_index_and_search_over_http() {
-        let _guard = test_lock().lock().unwrap();
+        let _guard = lock_tests();
 
         let repo_dir = unique_temp_path("repo");
         let home_dir = unique_temp_path("home");
@@ -2339,11 +2376,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_index_document_repo_and_search_chunks() {
-        let _guard = test_lock().lock().unwrap();
+        let _guard = lock_tests();
 
         let repo_dir = unique_temp_path("document-repo");
+        let library_dir = unique_temp_path("document-repo-library");
         std::fs::create_dir_all(repo_dir.join("docs")).unwrap();
-        std::fs::create_dir_all(repo_dir.join(".compas")).unwrap();
 
         std::fs::write(
             repo_dir.join("docs").join("guide.md"),
@@ -2397,12 +2434,14 @@ index:
         .unwrap();
 
         let _cwd_guard = CurrentDirGuard::set(&repo_dir);
+        let _env_guard = EnvVarGuard::set("COMPAS_DOCS_HOME", &library_dir);
 
-        let config = AppConfig::load(repo_dir.join("compas.yaml").to_str().unwrap()).unwrap();
+        let config = load_command_config(&repo_dir.join("compas.yaml"), None).unwrap();
+        let storage = document_storage_paths(&repo_dir);
         index_repo(config.clone()).await.unwrap();
 
         let embedder = build_embedder(&config.embedder).unwrap();
-        let store = EdgeStore::new(repo_dir.join(&config.store.path), &config.store.vector_name);
+        let store = EdgeStore::new(&storage.store_path, &config.store.vector_name);
         let hits = search_chunks(
             embedder.as_ref(),
             &store,
@@ -2434,9 +2473,15 @@ index:
             }),
             "expected at least one result with heading path or page metadata"
         );
+        assert!(!repo_dir.join(".compas").exists());
         assert!(!repo_dir.join(".compas").join("graph.json").exists());
         assert!(!repo_dir.join(".compas").join("audit.md").exists());
+        assert!(storage.store_path.exists());
+        assert!(storage.manifest_path.exists());
         std::fs::remove_dir_all(&repo_dir).unwrap();
+        if library_dir.exists() {
+            std::fs::remove_dir_all(library_dir).unwrap();
+        }
     }
 
     #[tokio::test]
@@ -2484,22 +2529,30 @@ index:
     #[test]
     fn test_load_command_config_builds_default_document_mode_for_folder_override() {
         let repo_dir = unique_temp_path("document-default-config");
+        let library_dir = unique_temp_path("document-default-config-library");
         std::fs::create_dir_all(&repo_dir).unwrap();
+        let _env_guard = EnvVarGuard::set("COMPAS_DOCS_HOME", &library_dir);
 
         let config = load_command_config(&repo_dir.join("missing.yaml"), Some(&repo_dir)).unwrap();
+        let storage = document_storage_paths(&repo_dir);
 
         assert_eq!(config.index.kind, "document");
         assert_eq!(config.repo.path, repo_dir.to_string_lossy());
         assert_eq!(config.repo.include, vec!["**/*.md", "**/*.txt", "**/*.pdf"]);
+        assert_eq!(Path::new(&config.store.path), storage.store_path.as_path());
 
         std::fs::remove_dir_all(&repo_dir).unwrap();
+        if library_dir.exists() {
+            std::fs::remove_dir_all(library_dir).unwrap();
+        }
     }
 
     #[tokio::test]
     async fn test_search_repo_returns_document_results_for_folder_mode() {
-        let _guard = test_lock().lock().unwrap();
+        let _guard = lock_tests();
 
         let repo_dir = unique_temp_path("document-search");
+        let library_dir = unique_temp_path("document-search-library");
         std::fs::create_dir_all(repo_dir.join("docs")).unwrap();
         std::fs::write(
             repo_dir.join("docs").join("policy.md"),
@@ -2512,7 +2565,10 @@ index:
         config.embedder.model = "test".into();
 
         let _cwd_guard = CurrentDirGuard::set(&repo_dir);
+        let _env_guard = EnvVarGuard::set("COMPAS_DOCS_HOME", &library_dir);
+        let storage = document_storage_paths(&repo_dir);
         index_repo(config.clone()).await.unwrap();
+        add_folder(&repo_dir).unwrap();
 
         let output = search_repo(config, "renewal date", 5).await.unwrap();
 
@@ -2523,8 +2579,14 @@ index:
         assert!(output.contains("policy.md"), "{output}");
         assert!(output.contains("Page: n/a"), "{output}");
         assert!(output.contains("Renewal date is January 15."), "{output}");
+        assert!(!repo_dir.join(".compas").exists());
+        assert!(storage.store_path.exists());
+        assert!(storage.manifest_path.exists());
 
         std::fs::remove_dir_all(&repo_dir).unwrap();
+        if library_dir.exists() {
+            std::fs::remove_dir_all(library_dir).unwrap();
+        }
     }
 
     struct CurrentDirGuard {
@@ -2542,6 +2604,29 @@ index:
     impl Drop for CurrentDirGuard {
         fn drop(&mut self) {
             let _ = std::env::set_current_dir(&self.original);
+        }
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        original: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &Path) -> Self {
+            let original = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(value) = &self.original {
+                std::env::set_var(self.key, value);
+            } else {
+                std::env::remove_var(self.key);
+            }
         }
     }
 

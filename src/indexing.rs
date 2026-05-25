@@ -116,6 +116,7 @@ pub struct Indexer<'a> {
     exclude: &'a [String],
     store: &'a dyn Store,
     embedder: &'a dyn Embedder,
+    manifest_path: PathBuf,
 }
 
 impl<'a> Indexer<'a> {
@@ -132,7 +133,13 @@ impl<'a> Indexer<'a> {
             exclude,
             store,
             embedder,
+            manifest_path: repo_path.join(".compas").join("manifest.json"),
         }
+    }
+
+    pub fn with_manifest_path(mut self, manifest_path: impl Into<PathBuf>) -> Self {
+        self.manifest_path = manifest_path.into();
+        self
     }
 
     pub async fn index_repo<A: IndexingAdapter>(&self, adapter: &A) -> Result<IndexingReport> {
@@ -510,7 +517,7 @@ impl<'a> Indexer<'a> {
     }
 
     fn manifest_path(&self) -> PathBuf {
-        self.repo_path.join(".compas").join("manifest.json")
+        self.manifest_path.clone()
     }
 
     async fn embed_chunks(

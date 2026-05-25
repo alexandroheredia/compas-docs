@@ -2,6 +2,7 @@ pub mod chunker;
 pub mod code;
 pub mod config;
 pub mod docs;
+pub mod docs_backend;
 pub mod embedder;
 pub mod indexing;
 pub mod mcp;
