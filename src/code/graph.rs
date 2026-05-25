@@ -24,7 +24,7 @@ struct GraphData {
 #[derive(Clone)]
 pub struct Graph {
     nodes: Arc<RwLock<HashMap<String, SymbolNode>>>,
-    edges: Arc<RwLock<HashMap<String, Vec<String>>>>, // caller_key -> callee_names
+    edges: Arc<RwLock<HashMap<String, Vec<String>>>>,
 }
 
 impl Default for Graph {
@@ -74,8 +74,7 @@ impl Graph {
     ) -> Vec<String> {
         let mut called_by = vec![];
         let bare_name = name.rsplit('.').next().unwrap_or(name);
-        for (caller_key, callees) in edges.iter() {
-            // Match either the fully qualified name (static calls) or bare method name (instance calls)
+        for (caller_key, callees) in edges {
             if callees.contains(&name.to_string()) || callees.contains(&bare_name.to_string()) {
                 if let Some(caller) = nodes.get(caller_key) {
                     called_by.push(caller.name.clone());
@@ -101,9 +100,6 @@ impl Graph {
         })
     }
 
-    /// Search for symbols by partial name match.
-    /// Returns nodes whose symbol name contains the query string (case-insensitive).
-    /// Also returns edge entries where the caller or callee matches.
     pub fn search(&self, query: &str) -> Vec<SymbolNode> {
         let query_lower = query.to_lowercase();
         let nodes = self.nodes.read().unwrap();
@@ -111,7 +107,6 @@ impl Graph {
         let mut results = vec![];
         let mut seen = std::collections::HashSet::new();
 
-        // Find nodes whose name contains the query
         for (key, node) in nodes.iter() {
             if node.name.to_lowercase().contains(&query_lower) {
                 let calls = self.build_calls(key, &edges);
@@ -126,8 +121,7 @@ impl Graph {
             }
         }
 
-        // Also find edges whose caller key contains the query
-        for (caller_key, _callees) in edges.iter() {
+        for caller_key in edges.keys() {
             if caller_key.to_lowercase().contains(&query_lower) && !seen.contains(caller_key) {
                 if let Some(node) = nodes.get(caller_key) {
                     let calls = self.build_calls(caller_key, &edges);
@@ -146,21 +140,18 @@ impl Graph {
         results
     }
 
-    /// Create phantom nodes for every callee referenced in edges
-    /// that doesn't have a corresponding symbol node.
     pub fn create_phantom_nodes(&self) {
         let edges = self.edges.read().unwrap();
         let mut nodes = self.nodes.write().unwrap();
         let mut phantom_callees = std::collections::HashSet::new();
 
-        for (_, callees) in edges.iter() {
+        for callees in edges.values() {
             for callee in callees {
                 phantom_callees.insert(callee.clone());
             }
         }
 
         for callee in phantom_callees {
-            // Check if any existing node has this name
             let exists = nodes.values().any(|n| n.name == callee);
             if !exists {
                 let key = format!("phantom:{}", callee);
@@ -178,7 +169,6 @@ impl Graph {
         }
     }
 
-    /// Returns all nodes with calls and called_by populated from edges.
     pub fn all_nodes(&self) -> HashMap<String, SymbolNode> {
         let nodes = self.nodes.read().unwrap();
         let edges = self.edges.read().unwrap();
@@ -220,7 +210,6 @@ impl Graph {
         Ok(())
     }
 
-    /// Remove all symbols and edges for a given file path.
     pub fn remove_by_file(&self, file: &str) {
         let mut nodes = self.nodes.write().unwrap();
         let mut edges = self.edges.write().unwrap();
@@ -228,7 +217,7 @@ impl Graph {
         let prefix = format!("{}:", file);
         let node_keys: Vec<String> = nodes
             .keys()
-            .filter(|k| k.starts_with(&prefix))
+            .filter(|key| key.starts_with(&prefix))
             .cloned()
             .collect();
         for key in node_keys {
@@ -237,7 +226,7 @@ impl Graph {
 
         let edge_keys: Vec<String> = edges
             .keys()
-            .filter(|k| k.starts_with(&prefix))
+            .filter(|key| key.starts_with(&prefix))
             .cloned()
             .collect();
         for key in edge_keys {

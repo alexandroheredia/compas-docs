@@ -5,24 +5,21 @@ use compas::{
         dart::extract_semantic_references, extract_calls_for_language, language_for_path,
         ChunkerRegistry,
     },
+    code::{graph::Graph, models::CodeChunk, CodeRuntime},
     config::AppConfig,
-    embedder::{build_embedder, EmbedMode},
-    graph::Graph,
+    embedder::build_embedder,
+    indexing::{Indexer, IndexingAdapter},
     mcp::{self, state::McpAppState},
+    models::IndexedChunk,
     server::{router, AppState, RepoState},
     store::{edge::EdgeStore, Store},
     watcher::{FileWatcher, Handler},
 };
-use indicatif::{ProgressBar, ProgressStyle};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::IsTerminal;
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::Instant;
+use std::sync::{Arc, Mutex};
 use tracing::{debug, info, warn};
-
-const EMBED_BATCH_SIZE: usize = 32;
 
 const FLUTTER_LIFECYCLE_METHODS: &[&str] = &[
     "build",
@@ -534,59 +531,163 @@ RIGHT: `search_codebase({ query: "how does X work", limit: 10 })` then read only
     Ok(())
 }
 
-fn hash_bytes(bytes: &[u8]) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::Hasher;
-    let mut hasher = DefaultHasher::new();
-    hasher.write(bytes);
-    format!("{:x}", hasher.finish())
-}
-
 fn is_flutter_boilerplate(symbol: &str) -> bool {
     let method_name = symbol.rsplit('.').next().unwrap_or(symbol);
     FLUTTER_LIFECYCLE_METHODS.contains(&method_name)
 }
 
-struct CompasIgnore {
-    matchers: Vec<globset::GlobMatcher>,
+type MissingDocEntry = (String, String, String, usize);
+
+struct PreparedCodeFile {
+    language: &'static str,
+    chunks: Vec<CodeChunk>,
+    indexed_chunks: Vec<IndexedChunk>,
 }
 
-impl CompasIgnore {
-    fn load(repo_path: &std::path::Path) -> Self {
-        let path = repo_path.join(".compasignore");
-        let mut matchers = Vec::new();
+struct CodeIndexAdapter {
+    repo_path: PathBuf,
+    graph_path: PathBuf,
+    graph: Arc<Graph>,
+    registry: ChunkerRegistry,
+    persist_graph: bool,
+    missing_docs: Mutex<Vec<MissingDocEntry>>,
+}
 
-        if let Ok(content) = std::fs::read_to_string(&path) {
-            for line in content.lines() {
-                let line = line.trim();
-                if line.is_empty() || line.starts_with('#') {
-                    continue;
-                }
-                if let Ok(glob) = globset::Glob::new(line) {
-                    matchers.push(glob.compile_matcher());
-                }
-                // Directory patterns (ending in /) should also match nested files
-                if line.ends_with('/') {
-                    let nested = format!("{}**", line);
-                    if let Ok(glob) = globset::Glob::new(&nested) {
-                        matchers.push(glob.compile_matcher());
-                    }
-                }
+impl CodeIndexAdapter {
+    fn new(repo_path: PathBuf, graph: Arc<Graph>, persist_graph: bool) -> Self {
+        let graph_path = repo_path.join(".compas").join("graph.json");
+
+        Self {
+            repo_path,
+            graph_path,
+            graph,
+            registry: ChunkerRegistry::new(),
+            persist_graph,
+            missing_docs: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn missing_docs(&self) -> Vec<MissingDocEntry> {
+        self.missing_docs.lock().unwrap().clone()
+    }
+
+    fn record_missing_docs(&self, file_path: &str, chunks: &[CodeChunk]) {
+        let display_path = relative_display_path(&self.repo_path, Path::new(file_path));
+        self.missing_docs
+            .lock()
+            .unwrap()
+            .extend(missing_docs_from_chunks(&display_path, chunks));
+    }
+
+    fn persist_graph_if_needed(&self) -> anyhow::Result<()> {
+        if !self.persist_graph {
+            return Ok(());
+        }
+
+        if let Some(parent) = self.graph_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        self.graph.save(&self.graph_path)
+    }
+}
+
+impl IndexingAdapter for CodeIndexAdapter {
+    type PreparedFile = PreparedCodeFile;
+
+    fn supports_path(&self, path: &Path) -> bool {
+        language_for_path(path).is_some()
+    }
+
+    fn prepare_file(
+        &self,
+        file_path: &str,
+        content: &str,
+    ) -> anyhow::Result<Option<Self::PreparedFile>> {
+        let path = Path::new(file_path);
+        let Some(language) = language_for_path(path) else {
+            return Ok(None);
+        };
+
+        let chunker = self
+            .registry
+            .get(language)
+            .ok_or_else(|| anyhow::anyhow!("no {} chunker available", language))?;
+        let chunks = chunker.chunk(file_path, content)?;
+
+        for chunk in &chunks {
+            let chunk_lines = chunk.line_end.saturating_sub(chunk.line_start);
+            if chunk_lines > 200 {
+                warn!(
+                    "  long {}: {} ({} lines)",
+                    chunk.kind, chunk.symbol, chunk_lines
+                );
             }
         }
 
-        Self { matchers }
+        let indexed_chunks = chunks.iter().cloned().map(IndexedChunk::from).collect();
+
+        Ok(Some(PreparedCodeFile {
+            language,
+            chunks,
+            indexed_chunks,
+        }))
     }
 
-    fn is_ignored(&self, relative_path: &std::path::Path) -> bool {
-        let path_str = relative_path.to_string_lossy();
-        for matcher in &self.matchers {
-            if matcher.is_match(&*path_str) {
-                return true;
+    fn indexed_chunks<'a>(&self, prepared: &'a Self::PreparedFile) -> &'a [IndexedChunk] {
+        &prepared.indexed_chunks
+    }
+
+    fn after_upsert(
+        &self,
+        file_path: &str,
+        content: &str,
+        prepared: &Self::PreparedFile,
+    ) -> anyhow::Result<()> {
+        self.graph.remove_by_file(file_path);
+
+        for chunk in &prepared.chunks {
+            let base_symbol = strip_part_suffix(&chunk.symbol);
+            self.graph
+                .add_symbol(&base_symbol, &chunk.file_path, &chunk.kind);
+        }
+
+        if let Ok(calls) = extract_calls_for_language(prepared.language, content) {
+            for (caller, callee) in &calls {
+                self.graph.add_symbol(caller, file_path, "method");
+                self.graph.add_call(caller, file_path, callee);
             }
         }
-        false
+
+        self.record_missing_docs(file_path, &prepared.chunks);
+        self.persist_graph_if_needed()
     }
+
+    fn after_delete(&self, file_path: &str) -> anyhow::Result<()> {
+        self.graph.remove_by_file(file_path);
+        self.persist_graph_if_needed()
+    }
+}
+
+fn missing_docs_from_chunks(display_file: &str, chunks: &[CodeChunk]) -> Vec<MissingDocEntry> {
+    chunks
+        .iter()
+        .filter(|chunk| {
+            !chunk.content.starts_with("///")
+                && !chunk.content.starts_with("//!")
+                && (chunk.kind == "method"
+                    || chunk.kind == "function"
+                    || chunk.kind == "constructor")
+                && !is_flutter_boilerplate(&chunk.symbol)
+        })
+        .map(|chunk| {
+            (
+                display_file.to_string(),
+                chunk.symbol.clone(),
+                chunk.kind.clone(),
+                chunk.line_start,
+            )
+        })
+        .collect()
 }
 
 fn relative_display_path(repo_path: &Path, file: &Path) -> String {
@@ -916,395 +1017,31 @@ async fn index_repo(config: AppConfig) -> anyhow::Result<()> {
     ));
     store.init(embedder.dimensions()).await?;
 
-    let registry = ChunkerRegistry::new();
-
-    // Load .compasignore patterns
-    let compas_ignore = CompasIgnore::load(&repo_path);
-
-    // Load existing graph
-    let graph = Graph::new();
+    let graph = Arc::new(Graph::new());
     let graph_path = repo_path.join(".compas").join("graph.json");
     if let Err(e) = graph.load(&graph_path) {
         debug!("no existing graph to load: {}", e);
     }
 
-    // ── First pass: discover files and compute hashes ───────────────────────
-    let mut files_with_hashes: Vec<(std::path::PathBuf, String)> = Vec::new();
-    for entry in walkdir::WalkDir::new(&repo_path) {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(e) => {
-                warn!("walkdir error: {}", e);
-                continue;
-            }
-        };
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        let path = entry.path();
-        let relative = path.strip_prefix(&repo_path).unwrap_or(path);
-        if !should_include(relative, &config.repo.include, &config.repo.exclude) {
-            continue;
-        }
-        if compas_ignore.is_ignored(relative) {
-            continue;
-        }
-        if language_for_path(path).is_none() {
-            continue;
-        }
+    let adapter = CodeIndexAdapter::new(repo_path.clone(), Arc::clone(&graph), false);
+    let indexer = Indexer::new(
+        &repo_path,
+        &config.repo.include,
+        &config.repo.exclude,
+        store.as_ref(),
+        embedder.as_ref(),
+    );
+    let report = indexer.index_repo(&adapter).await?;
 
-        let content = match std::fs::read_to_string(path) {
-            Ok(c) => c,
-            Err(e) => {
-                warn!("skip read error for {}: {}", path.display(), e);
-                continue;
-            }
-        };
-        let hash = hash_bytes(content.as_bytes());
-        files_with_hashes.push((path.to_path_buf(), hash));
-    }
-
-    // ── Load manifest and detect deleted / newly-ignored files ──────────────
-    let manifest_path = repo_path.join(".compas").join("manifest.json");
-    let old_manifest: std::collections::HashMap<String, String> =
-        std::fs::read_to_string(&manifest_path)
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default();
-
-    let mut new_manifest = old_manifest.clone();
-    let current_paths: std::collections::HashSet<String> = files_with_hashes
-        .iter()
-        .map(|(p, _)| p.to_string_lossy().to_string())
-        .collect();
-
-    let mut deleted_files = Vec::new();
-    for path in old_manifest.keys() {
-        if !current_paths.contains(path) {
-            deleted_files.push(path.clone());
-        }
-    }
-
-    // Clean up deleted files from store and graph
-    for path in &deleted_files {
-        if let Err(e) = store.delete_by_file(path).await {
-            warn!("failed to delete chunks for removed file {}: {}", path, e);
-        }
-        graph.remove_by_file(path);
-        new_manifest.remove(path);
-    }
-
-    let changed_count = files_with_hashes
-        .iter()
-        .filter(|(p, h)| old_manifest.get(&p.to_string_lossy().to_string()) != Some(h))
-        .count();
-
-    let use_tui = std::env::var("RUST_LOG").is_err() && std::io::stderr().is_terminal();
-
-    if use_tui {
-        println!(
-            "Indexing {}  ({} files, {} changed, {} deleted)",
-            repo_path.display(),
-            files_with_hashes.len(),
-            changed_count,
-            deleted_files.len()
-        );
-    } else {
-        info!(
-            "indexing {:?} ({} files, {} changed, {} deleted)",
-            repo_path,
-            files_with_hashes.len(),
-            changed_count,
-            deleted_files.len()
-        );
-    }
-
-    let pb = if use_tui {
-        let bar = ProgressBar::new(files_with_hashes.len() as u64);
-        bar.set_style(
-            ProgressStyle::with_template(
-                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg}",
-            )
-            .unwrap()
-            .progress_chars("=>-"),
-        );
-        bar.set_message("starting...");
-        Some(bar)
-    } else {
-        None
-    };
-
-    let start = Instant::now();
-    let mut processed = 0usize;
-    let mut skipped = 0usize;
-    let mut failed = 0usize;
-    let mut total_chunks = 0usize;
-    let mut chunks_without_docs: Vec<(String, String, String, usize)> = vec![];
-    let mut processed_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-    for (path, hash) in &files_with_hashes {
-        let path_str = path.to_string_lossy().to_string();
-        let relative = path.strip_prefix(&repo_path).unwrap_or(path);
-        let rel_str = relative.to_string_lossy().to_string();
-
-        // Skip unchanged files
-        if old_manifest.get(&path_str) == Some(hash) {
-            if let Some(ref bar) = pb {
-                bar.set_message(format!("skipping {}", rel_str));
-                bar.inc(1);
-            } else {
-                debug!("skipping unchanged file: {}", rel_str);
-            }
-            skipped += 1;
-            continue;
-        }
-
-        if let Some(ref bar) = pb {
-            bar.set_message(rel_str.clone());
-        } else {
-            info!("→ {}", rel_str);
-        }
-        let relative = path.strip_prefix(&repo_path).unwrap_or(path);
-        let rel_str = relative.to_string_lossy().to_string();
-
-        if let Some(ref bar) = pb {
-            bar.set_message(rel_str.clone());
-        } else {
-            info!("→ {}", rel_str);
-        }
-
-        let content = match tokio::fs::read_to_string(path).await {
-            Ok(c) => c,
-            Err(e) => {
-                if let Some(ref bar) = pb {
-                    bar.println(format!("⚠  skip read error in {}: {}", rel_str, e));
-                } else {
-                    warn!("  skip read error: {}", e);
-                }
-                failed += 1;
-                if let Some(ref bar) = pb {
-                    bar.inc(1);
-                }
-                continue;
-            }
-        };
-
-        let line_count = content.lines().count();
-        if line_count > 1000 {
-            if let Some(ref bar) = pb {
-                bar.println(format!("⚠  large file: {} ({} lines)", rel_str, line_count));
-            } else {
-                warn!("  ⚠️  large file: {} lines", line_count);
-            }
-        }
-
-        let language = match language_for_path(path) {
-            Some(language) => language,
-            None => continue,
-        };
-
-        let chunker = match registry.get(language) {
-            Some(chunker) => chunker,
-            None => {
-                if let Some(ref bar) = pb {
-                    bar.println(format!("warning: no {} chunker available", language));
-                    bar.inc(1);
-                } else {
-                    warn!("no {} chunker available", language);
-                }
-                failed += 1;
-                continue;
-            }
-        };
-
-        let chunks = match chunker.chunk(path.to_str().unwrap(), &content) {
-            Ok(c) => c,
-            Err(e) => {
-                if let Some(ref bar) = pb {
-                    bar.println(format!("⚠  skip chunk error in {}: {}", rel_str, e));
-                } else {
-                    warn!("  skip chunk error: {}", e);
-                }
-                failed += 1;
-                if let Some(ref bar) = pb {
-                    bar.inc(1);
-                }
-                continue;
-            }
-        };
-
-        if chunks.is_empty() {
-            if let Some(ref bar) = pb {
-                bar.inc(1);
-            } else {
-                info!("  0 chunks, skipping");
-            }
-            continue;
-        }
-
-        for chunk in &chunks {
-            let chunk_lines = chunk.line_end.saturating_sub(chunk.line_start);
-            if chunk_lines > 200 {
-                if let Some(ref bar) = pb {
-                    bar.println(format!(
-                        "⚠  long {}: {} ({} lines)",
-                        chunk.kind, chunk.symbol, chunk_lines
-                    ));
-                } else {
-                    warn!(
-                        "  ⚠️  long {}: {} ({} lines)",
-                        chunk.kind, chunk.symbol, chunk_lines
-                    );
-                }
-            }
-            if !chunk.content.starts_with("///")
-                && !chunk.content.starts_with("//!")
-                && (chunk.kind == "method"
-                    || chunk.kind == "function"
-                    || chunk.kind == "constructor")
-                && !is_flutter_boilerplate(&chunk.symbol)
-            {
-                chunks_without_docs.push((
-                    rel_str.clone(),
-                    chunk.symbol.clone(),
-                    chunk.kind.clone(),
-                    chunk.line_start,
-                ));
-            }
-        }
-
-        if let Err(e) = store.delete_by_file(path.to_str().unwrap()).await {
-            if let Some(ref bar) = pb {
-                bar.println(format!(
-                    "⚠  failed to delete old chunks in {}: {}",
-                    rel_str, e
-                ));
-            } else {
-                warn!("  failed to delete old chunks: {}", e);
-            }
-        }
-
-        // Embed in smaller batches to limit peak memory during inference.
-        let mut embeddings: Vec<Vec<f32>> = Vec::with_capacity(chunks.len());
-        let mut embed_failed = false;
-        for chunk_batch in chunks.chunks(EMBED_BATCH_SIZE) {
-            let texts: Vec<String> = chunk_batch.iter().map(|c| c.content.clone()).collect();
-            match embedder.embed_batch(&texts, EmbedMode::Document).await {
-                Ok(batch_embeddings) => embeddings.extend(batch_embeddings),
-                Err(e) => {
-                    if let Some(ref bar) = pb {
-                        bar.println(format!("⚠  skip embed error in {}: {}", rel_str, e));
-                    } else {
-                        warn!("  skip embed error: {}", e);
-                    }
-                    failed += 1;
-                    embed_failed = true;
-                    break;
-                }
-            }
-        }
-        if embed_failed {
-            if let Some(ref bar) = pb {
-                bar.inc(1);
-            }
-            continue;
-        }
-
-        if let Err(e) = store.upsert(&chunks, &embeddings).await {
-            if let Some(ref bar) = pb {
-                bar.println(format!("⚠  skip upsert error in {}: {}", rel_str, e));
-            } else {
-                warn!("  skip upsert error: {}", e);
-            }
-            failed += 1;
-            if let Some(ref bar) = pb {
-                bar.inc(1);
-            }
-            continue;
-        }
-
-        // Remove old symbols for this file before adding new ones
-        graph.remove_by_file(path_str.as_str());
-
-        for chunk in &chunks {
-            let base_symbol = strip_part_suffix(&chunk.symbol);
-            graph.add_symbol(&base_symbol, &chunk.file_path, &chunk.kind);
-        }
-
-        if let Ok(calls) = extract_calls_for_language(language, &content) {
-            for (caller, callee) in &calls {
-                graph.add_symbol(caller, path.to_str().unwrap(), "method");
-                graph.add_call(caller, path.to_str().unwrap(), callee);
-            }
-        }
-
-        processed += 1;
-        total_chunks += chunks.len();
-        new_manifest.insert(path_str.clone(), hash.clone());
-        processed_paths.insert(path_str);
-
-        if let Some(ref bar) = pb {
-            bar.inc(1);
-        } else {
-            info!("  ✓ done ({} chunks)", chunks.len());
-        }
-    }
-
-    // Scan unprocessed (unchanged) files for missing docs so audit is complete
-    for path_str in new_manifest.keys() {
-        if processed_paths.contains(path_str) {
-            continue;
-        }
-        let path = std::path::Path::new(path_str);
-        let relative = path.strip_prefix(&repo_path).unwrap_or(path);
-        let rel_str = relative.to_string_lossy().to_string();
-
-        let content = match std::fs::read_to_string(path) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-
-        let language = match language_for_path(path) {
-            Some(language) => language,
-            None => continue,
-        };
-
-        let chunker = match registry.get(language) {
-            Some(chunker) => chunker,
-            None => continue,
-        };
-
-        let chunks = match chunker.chunk(path_str, &content) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-
-        for chunk in &chunks {
-            if !chunk.content.starts_with("///")
-                && !chunk.content.starts_with("//!")
-                && (chunk.kind == "method"
-                    || chunk.kind == "function"
-                    || chunk.kind == "constructor")
-                && !is_flutter_boilerplate(&chunk.symbol)
-            {
-                chunks_without_docs.push((
-                    rel_str.clone(),
-                    chunk.symbol.clone(),
-                    chunk.kind.clone(),
-                    chunk.line_start,
-                ));
-            }
-        }
-    }
-
-    if let Some(bar) = pb {
-        bar.finish_and_clear();
-    }
-
-    let elapsed = start.elapsed();
+    let mut chunks_without_docs = adapter.missing_docs();
+    chunks_without_docs.extend(scan_missing_docs_for_manifest(
+        &repo_path,
+        &report.manifest,
+        &report.processed_paths,
+    ));
 
     graph.create_phantom_nodes();
-    if !use_tui {
+    if !report.used_tui {
         info!("created phantom nodes for external symbols");
     }
 
@@ -1313,7 +1050,8 @@ async fn index_repo(config: AppConfig) -> anyhow::Result<()> {
         .ok();
     graph.save(&graph_path)?;
 
-    let dart_manifest: std::collections::HashMap<String, String> = new_manifest
+    let dart_manifest: std::collections::HashMap<String, String> = report
+        .manifest
         .iter()
         .filter(|(path, _)| language_for_path(Path::new(path)) == Some("dart"))
         .map(|(path, hash)| (path.clone(), hash.clone()))
@@ -1323,20 +1061,16 @@ async fn index_repo(config: AppConfig) -> anyhow::Result<()> {
     let dead_code_candidates = classify_dead_code_candidates(&audit_analysis);
 
     generate_audit(
-        &graph,
+        graph.as_ref(),
         &dead_code_candidates,
         &chunks_without_docs,
-        processed,
-        total_chunks,
-        failed,
+        report.processed_files,
+        report.total_chunks,
+        report.failed_files,
     );
 
-    // Save manifest
-    let manifest_json = serde_json::to_string_pretty(&new_manifest)?;
-    tokio::fs::write(&manifest_path, manifest_json).await.ok();
-
     // ── Pretty summary ─────────────────────────────────────────────────────
-    let secs = elapsed.as_secs();
+    let secs = report.elapsed.as_secs();
     let mins = secs / 60;
     let rem_secs = secs % 60;
     let time_str = if mins > 0 {
@@ -1369,11 +1103,12 @@ async fn index_repo(config: AppConfig) -> anyhow::Result<()> {
     println!("    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!(
         "     {} changed  ·  {} skipped  ·  {} deleted",
-        processed,
-        skipped,
-        deleted_files.len()
+        report.processed_files, report.skipped_files, report.deleted_files
     );
-    println!("     {} chunks  ·  {} failed", total_chunks, failed);
+    println!(
+        "     {} chunks  ·  {} failed",
+        report.total_chunks, report.failed_files
+    );
     println!("    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!();
     println!(
@@ -1386,7 +1121,7 @@ async fn index_repo(config: AppConfig) -> anyhow::Result<()> {
     println!("    📋 Audit  → .compas/audit.md");
     println!();
 
-    if !use_tui {
+    if !report.used_tui {
         info!("indexing complete");
     }
 
@@ -1483,7 +1218,7 @@ async fn run_mcp() -> anyhow::Result<()> {
             name.clone(),
             compas::mcp::state::RepoState {
                 store,
-                graph,
+                code: Some(CodeRuntime { graph }),
                 embedder,
             },
         );
@@ -1567,7 +1302,7 @@ async fn serve() -> anyhow::Result<()> {
             RepoState {
                 config,
                 store,
-                graph,
+                code: Some(CodeRuntime { graph }),
                 embedder,
             },
         );
@@ -1634,162 +1369,75 @@ async fn watch(config: AppConfig) -> anyhow::Result<()> {
     edge_store.init(embedder.dimensions()).await?;
     let store: Arc<dyn compas::store::Store> = edge_store;
     let embedder: Arc<dyn compas::embedder::Embedder> = embedder;
+    let graph = Arc::new(Graph::new());
+    let graph_path = repo_path.join(".compas").join("graph.json");
+    if let Err(e) = graph.load(&graph_path) {
+        debug!("no existing graph to load: {}", e);
+    }
+
+    let watch_path = repo_path.clone();
     let handler = ReindexHandler {
         config,
+        repo_path,
         store,
         embedder,
-        registry: ChunkerRegistry::new(),
+        graph,
     };
-    FileWatcher::watch(&repo_path, handler).await
+    FileWatcher::watch(watch_path, handler).await
 }
 
 struct ReindexHandler {
     config: AppConfig,
+    repo_path: PathBuf,
     store: Arc<dyn compas::store::Store>,
     embedder: Arc<dyn compas::embedder::Embedder>,
-    registry: ChunkerRegistry,
+    graph: Arc<Graph>,
 }
 
 #[async_trait]
 impl Handler for ReindexHandler {
     async fn on_change(&self, file_path: &str) {
-        let path = std::path::Path::new(file_path);
-
-        if !path.is_file() {
-            return;
-        }
-
-        let repo_path = match std::fs::canonicalize(&self.config.repo.path) {
-            Ok(p) => p,
-            Err(_) => return,
-        };
-        let relative = path.strip_prefix(&repo_path).unwrap_or(path);
-        if !should_include(
-            relative,
-            &self.config.repo.include,
-            &self.config.repo.exclude,
-        ) {
-            return;
-        }
-        let language = match language_for_path(path) {
-            Some(language) => language,
-            None => return,
-        };
-
         info!("reindexing {}", file_path);
 
-        let content = match tokio::fs::read_to_string(file_path).await {
-            Ok(c) => c,
-            Err(e) => {
-                warn!("failed to read {}: {}", file_path, e);
-                return;
-            }
-        };
+        let adapter = CodeIndexAdapter::new(self.repo_path.clone(), Arc::clone(&self.graph), true);
+        let indexer = Indexer::new(
+            &self.repo_path,
+            &self.config.repo.include,
+            &self.config.repo.exclude,
+            self.store.as_ref(),
+            self.embedder.as_ref(),
+        );
 
-        let chunker = match self.registry.get(language) {
-            Some(c) => c,
-            None => {
-                warn!("no {} chunker available", language);
-                return;
-            }
-        };
-
-        let chunks = match chunker.chunk(file_path, &content) {
-            Ok(c) => c,
-            Err(e) => {
-                warn!("chunk failed for {}: {}", file_path, e);
-                return;
-            }
-        };
-
-        if let Err(e) = self.store.delete_by_file(file_path).await {
-            warn!("failed to delete old chunks for {}: {}", file_path, e);
-        }
-
-        if chunks.is_empty() {
-            info!("no chunks found in {}", file_path);
-            return;
-        }
-
-        let mut embeddings: Vec<Vec<f32>> = Vec::with_capacity(chunks.len());
-        for chunk_batch in chunks.chunks(EMBED_BATCH_SIZE) {
-            let texts: Vec<String> = chunk_batch.iter().map(|c| c.content.clone()).collect();
-            match self.embedder.embed_batch(&texts, EmbedMode::Document).await {
-                Ok(batch_embeddings) => embeddings.extend(batch_embeddings),
-                Err(e) => {
-                    warn!("embed failed for {}: {}", file_path, e);
-                    return;
+        match indexer.reindex_file(&adapter, file_path).await {
+            Ok(Some(chunk_count)) => {
+                if chunk_count == 0 {
+                    info!("no chunks found in {}", file_path);
+                } else {
+                    info!("reindexed {} ({} chunks)", file_path, chunk_count);
                 }
             }
+            Ok(None) => {}
+            Err(e) => warn!("reindex failed for {}: {}", file_path, e),
         }
-
-        if let Err(e) = self.store.upsert(&chunks, &embeddings).await {
-            warn!("upsert failed for {}: {}", file_path, e);
-            return;
-        }
-
-        // Update graph
-        let repo_path = match std::fs::canonicalize(&self.config.repo.path) {
-            Ok(p) => p,
-            Err(e) => {
-                warn!("failed to canonicalize repo path: {}", e);
-                return;
-            }
-        };
-        let graph_path = repo_path.join(".compas").join("graph.json");
-        let graph = Graph::new();
-        if let Err(e) = graph.load(&graph_path) {
-            debug!("no existing graph to load: {}", e);
-        }
-
-        graph.remove_by_file(file_path);
-        for chunk in &chunks {
-            let base_symbol = strip_part_suffix(&chunk.symbol);
-            graph.add_symbol(&base_symbol, &chunk.file_path, &chunk.kind);
-        }
-
-        // Extract call relationships from the AST
-        if let Ok(calls) = extract_calls_for_language(language, &content) {
-            for (caller, callee) in &calls {
-                graph.add_symbol(caller, file_path, "method");
-                graph.add_call(caller, file_path, callee);
-            }
-        }
-
-        if let Err(e) = graph.save(&graph_path) {
-            warn!("failed to save graph: {}", e);
-        }
-
-        info!("reindexed {} ({} chunks)", file_path, chunks.len());
     }
 
     async fn on_delete(&self, file_path: &str) {
         info!("deleting {}", file_path);
 
-        if let Err(e) = self.store.delete_by_file(file_path).await {
-            warn!("failed to delete chunks for {}: {}", file_path, e);
+        let adapter = CodeIndexAdapter::new(self.repo_path.clone(), Arc::clone(&self.graph), true);
+        let indexer = Indexer::new(
+            &self.repo_path,
+            &self.config.repo.include,
+            &self.config.repo.exclude,
+            self.store.as_ref(),
+            self.embedder.as_ref(),
+        );
+
+        match indexer.delete_file(&adapter, file_path).await {
+            Ok(true) => info!("deleted {}", file_path),
+            Ok(false) => {}
+            Err(e) => warn!("delete failed for {}: {}", file_path, e),
         }
-
-        let repo_path = match std::fs::canonicalize(&self.config.repo.path) {
-            Ok(p) => p,
-            Err(e) => {
-                warn!("failed to canonicalize repo path: {}", e);
-                return;
-            }
-        };
-        let graph_path = repo_path.join(".compas").join("graph.json");
-        let graph = Graph::new();
-        if let Err(e) = graph.load(&graph_path) {
-            debug!("no existing graph to load: {}", e);
-        }
-
-        graph.remove_by_file(file_path);
-
-        if let Err(e) = graph.save(&graph_path) {
-            warn!("failed to save graph: {}", e);
-        }
-
-        info!("deleted {}", file_path);
     }
 }
 
@@ -1940,6 +1588,43 @@ fn generate_audit(
     }
 }
 
+fn scan_missing_docs_for_manifest(
+    repo_path: &Path,
+    manifest: &HashMap<String, String>,
+    processed_paths: &HashSet<String>,
+) -> Vec<MissingDocEntry> {
+    let registry = ChunkerRegistry::new();
+    let mut missing_docs = Vec::new();
+
+    for path_str in manifest.keys() {
+        if processed_paths.contains(path_str) {
+            continue;
+        }
+
+        let path = Path::new(path_str);
+        let Some(language) = language_for_path(path) else {
+            continue;
+        };
+        let Some(chunker) = registry.get(language) else {
+            continue;
+        };
+
+        let content = match std::fs::read_to_string(path) {
+            Ok(content) => content,
+            Err(_) => continue,
+        };
+        let chunks = match chunker.chunk(path_str, &content) {
+            Ok(chunks) => chunks,
+            Err(_) => continue,
+        };
+
+        let display_path = relative_display_path(repo_path, path);
+        missing_docs.extend(missing_docs_from_chunks(&display_path, &chunks));
+    }
+
+    missing_docs
+}
+
 /// Strip the `_pN` suffix added by the chunker when splitting large chunks.
 /// This ensures graph symbols match the names returned by extract_calls.
 fn strip_part_suffix(symbol: &str) -> String {
@@ -1953,35 +1638,10 @@ fn strip_part_suffix(symbol: &str) -> String {
     symbol.to_string()
 }
 
-fn should_include(path: &std::path::Path, include: &[String], exclude: &[String]) -> bool {
-    let path_str = path.to_string_lossy();
-
-    for ex in exclude {
-        if let Ok(glob) = globset::Glob::new(ex) {
-            if glob.compile_matcher().is_match(&*path_str) {
-                return false;
-            }
-        }
-    }
-
-    if include.is_empty() {
-        return true;
-    }
-
-    for inc in include {
-        if let Ok(glob) = globset::Glob::new(inc) {
-            if glob.compile_matcher().is_match(&*path_str) {
-                return true;
-            }
-        }
-    }
-
-    false
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use compas::indexing::should_include;
     use serde_json::Value;
     use std::sync::{Mutex, OnceLock};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -2330,6 +1990,27 @@ mod tests {
         assert!(
             !results.is_empty(),
             "expected search results, got {response}"
+        );
+        let first = &results[0]["chunk"];
+        assert!(
+            first["symbol"].is_string(),
+            "expected chunk.symbol in {response}"
+        );
+        assert!(
+            first["language"].is_string(),
+            "expected chunk.language in {response}"
+        );
+        assert!(
+            first["line_start"].is_number(),
+            "expected chunk.line_start in {response}"
+        );
+        assert!(
+            first["line_end"].is_number(),
+            "expected chunk.line_end in {response}"
+        );
+        assert!(
+            first["type"].is_string(),
+            "expected chunk.type in {response}"
         );
         let symbols: Vec<&str> = results
             .iter()

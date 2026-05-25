@@ -1,0 +1,21 @@
+# Rust build output
+/target/
+
+# Local compas runtime artifacts
+/.compas/
+/compas.yaml
+
+# Planning scratch space
+/docs/temp/
+
+# macOS
+.DS_Store
+
+# Editor temp files
+*.swp
+*.swo
+*~
+
+# Common editor settings
+.idea/
+.vscode/

@@ -1,7 +1,7 @@
 #![allow(clippy::missing_transmute_annotations)]
 
 use crate::chunker::Chunker;
-use crate::models::Chunk;
+use crate::code::models::CodeChunk;
 use anyhow::Result;
 use tree_sitter::{Node, Parser};
 use uuid::Uuid;
@@ -15,7 +15,7 @@ impl Chunker for RustChunker {
         "rust"
     }
 
-    fn chunk(&self, file_path: &str, content: &str) -> Result<Vec<Chunk>> {
+    fn chunk(&self, file_path: &str, content: &str) -> Result<Vec<CodeChunk>> {
         let mut parser = init_parser()?;
         let tree = parser
             .parse(content, None)
@@ -27,7 +27,7 @@ impl Chunker for RustChunker {
 
         if chunks.is_empty() {
             let lines: Vec<&str> = content.lines().collect();
-            chunks.push(Chunk {
+            chunks.push(CodeChunk {
                 id: Uuid::new_v4().to_string(),
                 content: truncate_content(content, MAX_CHUNK_CHARS),
                 language: "rust".into(),
@@ -61,7 +61,7 @@ fn walk_items(
     content: &str,
     file_path: &str,
     module_prefix: Option<&str>,
-    chunks: &mut Vec<Chunk>,
+    chunks: &mut Vec<CodeChunk>,
 ) {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
@@ -105,7 +105,7 @@ fn push_named_item(
     node: Node,
     module_prefix: Option<&str>,
     kind: &str,
-    chunks: &mut Vec<Chunk>,
+    chunks: &mut Vec<CodeChunk>,
 ) {
     let Some(name) = extract_item_name(node, content) else {
         return;
@@ -128,7 +128,7 @@ fn extract_trait_item(
     content: &str,
     file_path: &str,
     module_prefix: Option<&str>,
-    chunks: &mut Vec<Chunk>,
+    chunks: &mut Vec<CodeChunk>,
 ) {
     let Some(name) = extract_item_name(node, content) else {
         return;
@@ -178,7 +178,7 @@ fn extract_impl_item(
     content: &str,
     file_path: &str,
     module_prefix: Option<&str>,
-    chunks: &mut Vec<Chunk>,
+    chunks: &mut Vec<CodeChunk>,
 ) {
     let Some(type_name) = extract_impl_type(node, content) else {
         return;
@@ -263,7 +263,7 @@ fn extract_mod_item(
     content: &str,
     file_path: &str,
     module_prefix: Option<&str>,
-    chunks: &mut Vec<Chunk>,
+    chunks: &mut Vec<CodeChunk>,
 ) {
     let Some(name) = extract_item_name(node, content) else {
         return;
@@ -567,7 +567,7 @@ fn push_chunk(
     kind: &str,
     start_byte: usize,
     end_byte: usize,
-    chunks: &mut Vec<Chunk>,
+    chunks: &mut Vec<CodeChunk>,
 ) {
     let start_line = byte_to_line(content, start_byte);
     let end_line = byte_to_line(content, end_byte.min(content.len()));
@@ -580,7 +580,7 @@ fn push_chunk(
     };
 
     if enriched.len() <= MAX_CHUNK_CHARS {
-        chunks.push(Chunk {
+        chunks.push(CodeChunk {
             id: Uuid::new_v4().to_string(),
             content: enriched,
             language: "rust".into(),
@@ -602,7 +602,7 @@ fn push_chunk(
         let end = (offset + chunk_line_count).min(lines.len());
         let slice = lines[offset..end].join("\n");
         let clamped = truncate_content(&slice, MAX_CHUNK_CHARS);
-        chunks.push(Chunk {
+        chunks.push(CodeChunk {
             id: Uuid::new_v4().to_string(),
             content: clamped,
             language: "rust".into(),

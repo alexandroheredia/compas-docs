@@ -6,12 +6,12 @@ mod dart_test;
 #[cfg(test)]
 mod rust_test;
 
-use crate::models::Chunk;
+use crate::code::models::CodeChunk;
 use anyhow::Result;
 
 pub trait Chunker: Send + Sync {
     fn language(&self) -> &'static str;
-    fn chunk(&self, file_path: &str, content: &str) -> Result<Vec<Chunk>>;
+    fn chunk(&self, file_path: &str, content: &str) -> Result<Vec<CodeChunk>>;
 }
 
 pub struct ChunkerRegistry {

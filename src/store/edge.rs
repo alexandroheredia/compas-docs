@@ -1,5 +1,6 @@
 use super::Store;
-use crate::models::{Chunk, SearchResult};
+use crate::code::models::{LANGUAGE_KEY, LINE_END_KEY, LINE_START_KEY, SYMBOL_KEY};
+use crate::models::{IndexedChunk, SearchHit};
 use anyhow::{anyhow, Context, Result};
 use fs4::FileExt;
 use qdrant_edge::{
@@ -188,7 +189,7 @@ impl Store for EdgeStore {
         self.with_locked_shard(Some(vector_size), |_shard| Ok(()))
     }
 
-    async fn upsert(&self, chunks: &[Chunk], embeddings: &[Vec<f32>]) -> Result<()> {
+    async fn upsert_indexed(&self, chunks: &[IndexedChunk], embeddings: &[Vec<f32>]) -> Result<()> {
         if chunks.len() != embeddings.len() {
             return Err(anyhow!(
                 "chunks/embedding count mismatch: {} chunks vs {} embeddings",
@@ -207,19 +208,44 @@ impl Store for EdgeStore {
                         chunk.id
                     )
                 })?;
+                let mut payload = serde_json::Map::from_iter([
+                    ("chunk_id".to_string(), Value::String(chunk.id.clone())),
+                    (
+                        "file_path".to_string(),
+                        Value::String(chunk.file_path.clone()),
+                    ),
+                    ("content".to_string(), Value::String(chunk.content.clone())),
+                    ("kind".to_string(), Value::String(chunk.kind.clone())),
+                    (
+                        "metadata".to_string(),
+                        Value::Object(chunk.metadata.clone().into_iter().collect()),
+                    ),
+                    ("type".to_string(), Value::String(chunk.kind.clone())),
+                ]);
+
+                if let Some(language) = chunk.metadata_str(LANGUAGE_KEY) {
+                    payload.insert("language".to_string(), Value::String(language.to_string()));
+                }
+                if let Some(symbol) = chunk.metadata_str(SYMBOL_KEY) {
+                    payload.insert("symbol".to_string(), Value::String(symbol.to_string()));
+                }
+                if let Some(line_start) = chunk.metadata_usize(LINE_START_KEY) {
+                    payload.insert(
+                        "line_start".to_string(),
+                        Value::Number((line_start as u64).into()),
+                    );
+                }
+                if let Some(line_end) = chunk.metadata_usize(LINE_END_KEY) {
+                    payload.insert(
+                        "line_end".to_string(),
+                        Value::Number((line_end as u64).into()),
+                    );
+                }
+
                 Ok(PointStruct::new(
                     id,
                     Vectors::new_named([(self.vector_name.as_str(), embedding.clone())]),
-                    serde_json::json!({
-                        "chunk_id": chunk.id,
-                        "file_path": chunk.file_path,
-                        "symbol": chunk.symbol,
-                        "language": chunk.language,
-                        "type": chunk.kind,
-                        "content": chunk.content,
-                        "line_start": chunk.line_start,
-                        "line_end": chunk.line_end,
-                    }),
+                    Value::Object(payload),
                 )
                 .into())
             })
@@ -235,12 +261,12 @@ impl Store for EdgeStore {
         })
     }
 
-    async fn search(
+    async fn search_indexed(
         &self,
         embedding: &[f32],
         limit: usize,
         filters: &HashMap<String, String>,
-    ) -> Result<Vec<SearchResult>> {
+    ) -> Result<Vec<SearchHit>> {
         let filter = build_filter(filters)?;
 
         self.with_locked_shard(Some(embedding.len()), |shard| {
@@ -313,32 +339,56 @@ fn build_filter(filters: &HashMap<String, String>) -> Result<Option<Filter>> {
     }))
 }
 
-fn search_result_from_scored_point(point: ScoredPoint) -> Result<SearchResult> {
+fn search_result_from_scored_point(point: ScoredPoint) -> Result<SearchHit> {
     let payload = point
         .payload
         .ok_or_else(|| anyhow!("edge search result missing payload"))?;
 
-    Ok(SearchResult {
-        chunk: Chunk {
+    let metadata = payload_metadata(&payload)?;
+    let kind = payload_string(&payload, "kind")?
+        .or_else(|| payload_string(&payload, "type").ok().flatten())
+        .ok_or_else(|| anyhow!("edge search result missing kind payload"))?;
+
+    Ok(SearchHit {
+        chunk: IndexedChunk {
             id: payload_string(&payload, "chunk_id")?.unwrap_or_else(|| point.id.to_string()),
             file_path: payload_string(&payload, "file_path")?
                 .ok_or_else(|| anyhow!("edge search result missing file_path payload"))?,
-            symbol: payload_string(&payload, "symbol")?
-                .ok_or_else(|| anyhow!("edge search result missing symbol payload"))?,
-            language: payload_string(&payload, "language")?
-                .ok_or_else(|| anyhow!("edge search result missing language payload"))?,
-            kind: payload_string(&payload, "type")?
-                .ok_or_else(|| anyhow!("edge search result missing type payload"))?,
             content: payload_string(&payload, "content")?
                 .ok_or_else(|| anyhow!("edge search result missing content payload"))?,
-            line_start: payload_usize(&payload, "line_start")?
-                .ok_or_else(|| anyhow!("edge search result missing line_start payload"))?,
-            line_end: payload_usize(&payload, "line_end")?
-                .ok_or_else(|| anyhow!("edge search result missing line_end payload"))?,
-            meta: Default::default(),
+            kind,
+            metadata,
         },
         score: point.score,
     })
+}
+
+fn payload_metadata(payload: &Payload) -> Result<HashMap<String, Value>> {
+    if let Some(Value::Object(metadata)) = payload.0.get("metadata") {
+        return Ok(metadata.clone().into_iter().collect());
+    }
+
+    let mut metadata = HashMap::new();
+    if let Some(symbol) = payload_string(payload, "symbol")? {
+        metadata.insert(SYMBOL_KEY.to_string(), Value::String(symbol));
+    }
+    if let Some(language) = payload_string(payload, "language")? {
+        metadata.insert(LANGUAGE_KEY.to_string(), Value::String(language));
+    }
+    if let Some(line_start) = payload_usize(payload, "line_start")? {
+        metadata.insert(
+            LINE_START_KEY.to_string(),
+            Value::Number((line_start as u64).into()),
+        );
+    }
+    if let Some(line_end) = payload_usize(payload, "line_end")? {
+        metadata.insert(
+            LINE_END_KEY.to_string(),
+            Value::Number((line_end as u64).into()),
+        );
+    }
+
+    Ok(metadata)
 }
 
 fn payload_string(payload: &Payload, key: &str) -> Result<Option<String>> {
@@ -381,7 +431,8 @@ fn parse_json_path(path: &str) -> Result<JsonPath> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::Chunk;
+    use crate::code::models::{CodeChunk, CodeSearchResult};
+    use serde_json::json;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -393,8 +444,8 @@ mod tests {
         std::env::temp_dir().join(format!("compas-edge-{test_name}-{nanos}"))
     }
 
-    fn sample_chunk(id: &str, file_path: &str, symbol: &str, language: &str) -> Chunk {
-        Chunk {
+    fn sample_chunk(id: &str, file_path: &str, symbol: &str, language: &str) -> CodeChunk {
+        CodeChunk {
             id: id.to_string(),
             content: format!("{symbol} body"),
             language: language.to_string(),
@@ -404,6 +455,19 @@ mod tests {
             line_end: 5,
             kind: "method".to_string(),
             meta: Default::default(),
+        }
+    }
+
+    fn sample_indexed_chunk(id: &str, file_path: &str) -> IndexedChunk {
+        IndexedChunk {
+            id: id.to_string(),
+            content: "section body".to_string(),
+            file_path: file_path.to_string(),
+            kind: "section".to_string(),
+            metadata: HashMap::from([
+                ("title".to_string(), json!("Annual Report 2024")),
+                ("page_start".to_string(), json!(37)),
+            ]),
         }
     }
 
@@ -429,11 +493,20 @@ mod tests {
         ];
         let embeddings = vec![vec![1.0, 0.0, 0.0, 0.0], vec![0.0, 1.0, 0.0, 0.0]];
 
-        store.upsert(&chunks, &embeddings).await.unwrap();
-
-        let results = store
-            .search(&[1.0, 0.0, 0.0, 0.0], 5, &HashMap::new())
+        let indexed_chunks: Vec<IndexedChunk> =
+            chunks.into_iter().map(IndexedChunk::from).collect();
+        store
+            .upsert_indexed(&indexed_chunks, &embeddings)
             .await
+            .unwrap();
+
+        let results: Vec<CodeSearchResult> = store
+            .search_indexed(&[1.0, 0.0, 0.0, 0.0], 5, &HashMap::new())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(CodeSearchResult::try_from)
+            .collect::<Result<_>>()
             .unwrap();
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].chunk.id, "11111111-1111-1111-1111-111111111111");
@@ -441,9 +514,13 @@ mod tests {
 
         store.delete_by_file("/tmp/lib/auth.dart").await.unwrap();
 
-        let remaining = store
-            .search(&[1.0, 0.0, 0.0, 0.0], 5, &HashMap::new())
+        let remaining: Vec<CodeSearchResult> = store
+            .search_indexed(&[1.0, 0.0, 0.0, 0.0], 5, &HashMap::new())
             .await
+            .unwrap()
+            .into_iter()
+            .map(CodeSearchResult::try_from)
+            .collect::<Result<_>>()
             .unwrap();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].chunk.file_path, "/tmp/lib/cache.dart");
@@ -451,9 +528,13 @@ mod tests {
         drop(store);
 
         let reopened = EdgeStore::new(&shard_path, "default");
-        let persisted = reopened
-            .search(&[0.0, 1.0, 0.0, 0.0], 5, &HashMap::new())
+        let persisted: Vec<CodeSearchResult> = reopened
+            .search_indexed(&[0.0, 1.0, 0.0, 0.0], 5, &HashMap::new())
             .await
+            .unwrap()
+            .into_iter()
+            .map(CodeSearchResult::try_from)
+            .collect::<Result<_>>()
             .unwrap();
         assert_eq!(persisted.len(), 1);
         assert_eq!(persisted[0].chunk.symbol, "CacheService.save");
@@ -507,14 +588,23 @@ mod tests {
             ),
         ];
         let embeddings = vec![vec![0.8, 0.2, 0.0, 0.0], vec![0.8, 0.2, 0.0, 0.0]];
-        store.upsert(&chunks, &embeddings).await.unwrap();
+        let indexed_chunks: Vec<IndexedChunk> =
+            chunks.into_iter().map(IndexedChunk::from).collect();
+        store
+            .upsert_indexed(&indexed_chunks, &embeddings)
+            .await
+            .unwrap();
 
         let mut filters = HashMap::new();
         filters.insert("language".to_string(), "dart".to_string());
 
-        let results = store
-            .search(&[0.8, 0.2, 0.0, 0.0], 5, &filters)
+        let results: Vec<CodeSearchResult> = store
+            .search_indexed(&[0.8, 0.2, 0.0, 0.0], 5, &filters)
             .await
+            .unwrap()
+            .into_iter()
+            .map(CodeSearchResult::try_from)
+            .collect::<Result<_>>()
             .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].chunk.language, "dart");
@@ -537,7 +627,7 @@ mod tests {
             "dart",
         );
         let err = store
-            .upsert(&[chunk], &[vec![1.0, 0.0, 0.0, 0.0]])
+            .upsert_indexed(&[IndexedChunk::from(chunk)], &[vec![1.0, 0.0, 0.0, 0.0]])
             .await
             .unwrap_err();
 
@@ -585,7 +675,7 @@ mod tests {
         let store = EdgeStore::new(&shard_path, "default");
         store.init(4).await.unwrap();
 
-        let chunks: Vec<Chunk> = (0..128)
+        let chunks: Vec<CodeChunk> = (0..128)
             .map(|index| {
                 sample_chunk(
                     &format!("00000000-0000-0000-0000-{:012}", index + 1),
@@ -599,11 +689,16 @@ mod tests {
             .map(|index| vec![1.0, index as f32 / 128.0, 0.0, 0.0])
             .collect();
 
-        store.upsert(&chunks, &embeddings).await.unwrap();
+        let indexed_chunks: Vec<IndexedChunk> =
+            chunks.into_iter().map(IndexedChunk::from).collect();
+        store
+            .upsert_indexed(&indexed_chunks, &embeddings)
+            .await
+            .unwrap();
         let _ = store.optimize().unwrap();
 
         let results = store
-            .search(&[1.0, 0.0, 0.0, 0.0], 10, &HashMap::new())
+            .search_indexed(&[1.0, 0.0, 0.0, 0.0], 10, &HashMap::new())
             .await
             .unwrap();
         assert_eq!(results.len(), 10);
@@ -625,15 +720,24 @@ mod tests {
             "dart",
         )];
         let embeddings = vec![vec![1.0, 0.0, 0.0, 0.0]];
-        store.upsert(&chunks, &embeddings).await.unwrap();
+        let indexed_chunks: Vec<IndexedChunk> =
+            chunks.into_iter().map(IndexedChunk::from).collect();
+        store
+            .upsert_indexed(&indexed_chunks, &embeddings)
+            .await
+            .unwrap();
 
         let tasks: Vec<_> = (0..8)
             .map(|_| {
                 let store = Arc::clone(&store);
                 tokio::spawn(async move {
                     store
-                        .search(&[1.0, 0.0, 0.0, 0.0], 5, &HashMap::new())
+                        .search_indexed(&[1.0, 0.0, 0.0, 0.0], 5, &HashMap::new())
                         .await
+                        .unwrap()
+                        .into_iter()
+                        .map(CodeSearchResult::try_from)
+                        .collect::<Result<Vec<_>>>()
                         .unwrap()
                 })
             })
@@ -662,7 +766,12 @@ mod tests {
             "dart",
         )];
         let embeddings = vec![vec![1.0, 0.0, 0.0, 0.0]];
-        writer.upsert(&chunks, &embeddings).await.unwrap();
+        let indexed_chunks: Vec<IndexedChunk> =
+            chunks.into_iter().map(IndexedChunk::from).collect();
+        writer
+            .upsert_indexed(&indexed_chunks, &embeddings)
+            .await
+            .unwrap();
 
         let reader = Arc::new(EdgeStore::new(&shard_path, "default"));
 
@@ -670,8 +779,12 @@ mod tests {
             let writer = Arc::clone(&writer);
             tokio::spawn(async move {
                 writer
-                    .search(&[1.0, 0.0, 0.0, 0.0], 5, &HashMap::new())
+                    .search_indexed(&[1.0, 0.0, 0.0, 0.0], 5, &HashMap::new())
                     .await
+                    .unwrap()
+                    .into_iter()
+                    .map(CodeSearchResult::try_from)
+                    .collect::<Result<Vec<_>>>()
                     .unwrap()
             })
         };
@@ -679,8 +792,12 @@ mod tests {
             let reader = Arc::clone(&reader);
             tokio::spawn(async move {
                 reader
-                    .search(&[1.0, 0.0, 0.0, 0.0], 5, &HashMap::new())
+                    .search_indexed(&[1.0, 0.0, 0.0, 0.0], 5, &HashMap::new())
                     .await
+                    .unwrap()
+                    .into_iter()
+                    .map(CodeSearchResult::try_from)
+                    .collect::<Result<Vec<_>>>()
                     .unwrap()
             })
         };
@@ -695,6 +812,91 @@ mod tests {
 
         drop(writer);
         drop(reader);
+        fs::remove_dir_all(shard_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn edge_store_round_trips_indexed_chunk_metadata() {
+        let shard_path = temp_shard_path("indexed-metadata");
+        let store = EdgeStore::new(&shard_path, "default");
+        store.init(4).await.unwrap();
+
+        let chunk = sample_indexed_chunk(
+            "77777777-7777-7777-7777-777777777777",
+            "/tmp/docs/report.pdf",
+        );
+        store
+            .upsert_indexed(&[chunk], &[vec![1.0, 0.0, 0.0, 0.0]])
+            .await
+            .unwrap();
+
+        let results = store
+            .search_indexed(&[1.0, 0.0, 0.0, 0.0], 5, &HashMap::new())
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].chunk.kind, "section");
+        assert_eq!(
+            results[0].chunk.metadata_str("title"),
+            Some("Annual Report 2024")
+        );
+        assert_eq!(results[0].chunk.metadata_usize("page_start"), Some(37));
+
+        drop(store);
+        fs::remove_dir_all(shard_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn edge_store_reads_legacy_code_payload_without_metadata_map() {
+        let shard_path = temp_shard_path("legacy-payload");
+        let store = EdgeStore::new(&shard_path, "default");
+        store.init(4).await.unwrap();
+
+        store
+            .with_locked_shard(None, |shard| {
+                let point = PointStruct::new(
+                    "88888888-8888-8888-8888-888888888888"
+                        .parse::<PointId>()
+                        .unwrap(),
+                    Vectors::new_named([("default", vec![1.0, 0.0, 0.0, 0.0])]),
+                    serde_json::json!({
+                        "chunk_id": "88888888-8888-8888-8888-888888888888",
+                        "file_path": "/tmp/lib/auth.dart",
+                        "symbol": "AuthService.login",
+                        "language": "dart",
+                        "type": "method",
+                        "content": "auth body",
+                        "line_start": 10,
+                        "line_end": 18
+                    }),
+                );
+
+                shard
+                    .update(UpdateOperation::PointOperation(
+                        PointOperations::UpsertPoints(PointInsertOperations::PointsList(vec![
+                            point.into(),
+                        ])),
+                    ))
+                    .map_err(edge_error)
+                    .context("failed to insert legacy payload")
+            })
+            .unwrap();
+
+        let results = store
+            .search_indexed(&[1.0, 0.0, 0.0, 0.0], 5, &HashMap::new())
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].chunk.kind, "method");
+        assert_eq!(
+            results[0].chunk.metadata_str(SYMBOL_KEY),
+            Some("AuthService.login")
+        );
+        assert_eq!(results[0].chunk.metadata_str(LANGUAGE_KEY), Some("dart"));
+        assert_eq!(results[0].chunk.metadata_usize(LINE_START_KEY), Some(10));
+        assert_eq!(results[0].chunk.metadata_usize(LINE_END_KEY), Some(18));
+
+        drop(store);
         fs::remove_dir_all(shard_path).unwrap();
     }
 }

@@ -1,7 +1,9 @@
+use crate::code::{ranking::rerank_code_results, CodeRuntime};
 use crate::config::AppConfig;
-use crate::embedder::{EmbedMode, Embedder};
-use crate::graph::Graph;
-use crate::search::rerank_results;
+use crate::embedder::Embedder;
+#[cfg(test)]
+use crate::models::{IndexedChunk, SearchHit};
+use crate::search::search_chunks;
 use crate::store::Store;
 use axum::{extract::Query, middleware, response::Json, routing::get, Router};
 use serde_json::json;
@@ -11,7 +13,7 @@ use std::sync::Arc;
 pub struct RepoState {
     pub config: AppConfig,
     pub store: Arc<dyn Store>,
-    pub graph: Arc<Graph>,
+    pub code: Option<CodeRuntime>,
     pub embedder: Arc<dyn Embedder>,
 }
 
@@ -78,11 +80,12 @@ async fn health(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::code::graph::Graph;
     use crate::config::{
         AppConfig, EmbedderConfig, IndexConfig, RepoConfig, ServerConfig, StoreConfig,
     };
     use crate::embedder::{EmbedMode, Embedder};
-    use crate::models::{Chunk, SearchResult};
+    use crate::models::{IndexedChunk, SearchHit};
     use anyhow::{anyhow, Result};
 
     struct PanicStore;
@@ -93,16 +96,20 @@ mod tests {
             Err(anyhow!("store.init should not be called by /health"))
         }
 
-        async fn upsert(&self, _chunks: &[Chunk], _embeddings: &[Vec<f32>]) -> Result<()> {
+        async fn upsert_indexed(
+            &self,
+            _chunks: &[IndexedChunk],
+            _embeddings: &[Vec<f32>],
+        ) -> Result<()> {
             unreachable!("upsert is not used by /health tests")
         }
 
-        async fn search(
+        async fn search_indexed(
             &self,
             _embedding: &[f32],
             _limit: usize,
             _filters: &HashMap<String, String>,
-        ) -> Result<Vec<SearchResult>> {
+        ) -> Result<Vec<SearchHit>> {
             unreachable!("search is not used by /health tests")
         }
 
@@ -165,7 +172,9 @@ mod tests {
                 RepoState {
                     config: sample_config(),
                     store: Arc::new(PanicStore),
-                    graph: Arc::new(Graph::new()),
+                    code: Some(CodeRuntime {
+                        graph: Arc::new(Graph::new()),
+                    }),
                     embedder: Arc::new(FakeEmbedder),
                 },
             )]),
@@ -180,6 +189,40 @@ mod tests {
         assert_eq!(value["repos"]["bookswipe"]["path"], "/tmp/bookswipe");
         assert_eq!(value["repos"]["bookswipe"]["store_provider"], "edge");
         assert_eq!(value["repos"]["bookswipe"]["vector_name"], "default");
+    }
+}
+
+#[cfg(test)]
+struct StaticSearchStore {
+    hits: Vec<SearchHit>,
+}
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl Store for StaticSearchStore {
+    async fn init(&self, _vector_size: usize) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn upsert_indexed(
+        &self,
+        _chunks: &[IndexedChunk],
+        _embeddings: &[Vec<f32>],
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn search_indexed(
+        &self,
+        _embedding: &[f32],
+        _limit: usize,
+        _filters: &HashMap<String, String>,
+    ) -> anyhow::Result<Vec<SearchHit>> {
+        Ok(self.hits.clone())
+    }
+
+    async fn delete_by_file(&self, _file_path: &str) -> anyhow::Result<()> {
+        Ok(())
     }
 }
 
@@ -217,19 +260,28 @@ async fn search_handler(
         filters.insert("language".into(), lang.clone());
     }
 
-    match repo.embedder.embed(&query, EmbedMode::Query).await {
-        Ok(embedding) => match repo.store.search(&embedding, limit * 3, &filters).await {
-            Ok(raw_results) => {
-                let results = rerank_results(repo.graph.as_ref(), raw_results, &query, limit);
+    let Some(code) = repo.code.as_ref() else {
+        return Json(json!({"error": "code search unavailable for this repo"}));
+    };
 
-                Json(json!({
-                    "query": query,
-                    "results": results,
-                }))
-            }
-            Err(e) => Json(json!({"error": format!("search failed: {}", e)})),
-        },
-        Err(e) => Json(json!({"error": format!("embedding failed: {}", e)})),
+    match search_chunks(
+        repo.embedder.as_ref(),
+        repo.store.as_ref(),
+        &query,
+        limit * 3,
+        &filters,
+    )
+    .await
+    {
+        Ok(raw_results) => {
+            let results = rerank_code_results(code.graph.as_ref(), raw_results, &query, limit);
+
+            Json(json!({
+                "query": query,
+                "results": results,
+            }))
+        }
+        Err(e) => Json(json!({"error": format!("search failed: {}", e)})),
     }
 }
 
@@ -247,15 +299,131 @@ async fn graph_handler(
     if symbol.is_empty() {
         return Json(json!({"error": "missing symbol"}));
     }
-    let exact = repo.graph.get(&symbol, &file);
+    let Some(code) = repo.code.as_ref() else {
+        return Json(json!({"error": "graph unavailable for this repo"}));
+    };
+    let exact = code.graph.get(&symbol, &file);
     let matches = if let Some(node) = exact {
         vec![node]
     } else {
-        repo.graph.search(&symbol)
+        code.graph.search(&symbol)
     };
     if matches.is_empty() {
         Json(json!({"error": "symbol not found"}))
     } else {
         Json(json!(matches))
+    }
+}
+
+#[cfg(test)]
+mod search_shape_tests {
+    use super::*;
+    use crate::code::graph::Graph;
+    use crate::code::models::{CodeChunk, CodeSearchResult};
+    use crate::embedder::{EmbedMode, Embedder};
+    use crate::models::SearchHit;
+    use serde_json::Value;
+
+    fn sample_config() -> AppConfig {
+        AppConfig {
+            repo: crate::config::RepoConfig {
+                path: "/tmp/bookswipe".to_string(),
+                include: vec!["lib/**/*.dart".to_string()],
+                exclude: vec![],
+            },
+            embedder: crate::config::EmbedderConfig {
+                provider: "fastembed".to_string(),
+                model: "nomic-ai/nomic-embed-text-v1.5".to_string(),
+                query_prefix: None,
+                doc_prefix: None,
+            },
+            store: crate::config::StoreConfig {
+                provider: "edge".to_string(),
+                path: ".compas/edge-shard".to_string(),
+                vector_name: "default".to_string(),
+            },
+            server: crate::config::ServerConfig {
+                port: "3001".to_string(),
+                host: "127.0.0.1".to_string(),
+            },
+            index: crate::config::IndexConfig {
+                chunk_by: "function".to_string(),
+                watch: true,
+            },
+        }
+    }
+
+    struct FakeSearchEmbedder;
+
+    #[async_trait::async_trait]
+    impl Embedder for FakeSearchEmbedder {
+        async fn embed(&self, _text: &str, _mode: EmbedMode) -> anyhow::Result<Vec<f32>> {
+            Ok(vec![1.0, 0.0, 0.0, 0.0])
+        }
+
+        async fn embed_batch(
+            &self,
+            texts: &[String],
+            _mode: EmbedMode,
+        ) -> anyhow::Result<Vec<Vec<f32>>> {
+            Ok(texts.iter().map(|_| vec![1.0, 0.0, 0.0, 0.0]).collect())
+        }
+
+        fn dimensions(&self) -> usize {
+            4
+        }
+    }
+
+    #[tokio::test]
+    async fn search_handler_returns_legacy_code_chunk_shape_from_generic_hits() {
+        let hit: SearchHit = CodeSearchResult {
+            chunk: CodeChunk {
+                id: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string(),
+                content: "auth body".to_string(),
+                language: "dart".to_string(),
+                file_path: "/tmp/lib/auth.dart".to_string(),
+                symbol: "AuthService.login".to_string(),
+                line_start: 10,
+                line_end: 18,
+                kind: "method".to_string(),
+                meta: HashMap::new(),
+            },
+            score: 0.75,
+        }
+        .into();
+
+        let state = Arc::new(AppState {
+            repos: HashMap::from([(
+                "bookswipe".to_string(),
+                RepoState {
+                    config: sample_config(),
+                    store: Arc::new(StaticSearchStore { hits: vec![hit] }),
+                    code: Some(CodeRuntime {
+                        graph: Arc::new(Graph::new()),
+                    }),
+                    embedder: Arc::new(FakeSearchEmbedder),
+                },
+            )]),
+            default_repo: Some("bookswipe".to_string()),
+        });
+
+        let Json(value) = search_handler(
+            Query(HashMap::from([
+                ("repo".to_string(), "bookswipe".to_string()),
+                ("q".to_string(), "authentication".to_string()),
+            ])),
+            axum::extract::State(state),
+        )
+        .await;
+
+        let first = &value["results"][0]["chunk"];
+        assert_eq!(
+            first["symbol"],
+            Value::String("AuthService.login".to_string())
+        );
+        assert_eq!(first["language"], Value::String("dart".to_string()));
+        assert_eq!(first["line_start"], Value::from(10));
+        assert_eq!(first["line_end"], Value::from(18));
+        assert_eq!(first["type"], Value::String("method".to_string()));
     }
 }

@@ -1,12 +1,12 @@
+use crate::code::CodeRuntime;
 use crate::embedder::Embedder;
-use crate::graph::Graph;
 use crate::store::Store;
 use std::collections::HashMap;
 use std::sync::Arc;
 
 pub struct RepoState {
     pub store: Arc<dyn Store>,
-    pub graph: Arc<Graph>,
+    pub code: Option<CodeRuntime>,
     pub embedder: Arc<dyn Embedder>,
 }
 

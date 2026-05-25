@@ -1,8 +1,8 @@
 use super::state::{McpAppState, RepoState};
 use super::types::*;
-use crate::embedder::EmbedMode;
-use crate::models::SearchResult;
-use crate::search::rerank_results;
+use crate::code::models::CodeSearchResult;
+use crate::code::ranking::rerank_code_results;
+use crate::search::search_chunks;
 use serde_json::json;
 use std::collections::HashMap;
 
@@ -95,19 +95,25 @@ async fn handle_search(
 
     let (_, repo) = resolve_repo(state, args)?;
 
-    let embedding = repo
-        .embedder
-        .embed(query, EmbedMode::Query)
-        .await
-        .map_err(|e| format!("embed failed: {}", e))?;
-
     let mut filters = HashMap::new();
     if let Some(lang) = language {
         filters.insert("language".into(), lang.into());
     }
 
-    let results = match repo.store.search(&embedding, limit * 3, &filters).await {
-        Ok(raw_results) => rerank_results(repo.graph.as_ref(), raw_results, query, limit),
+    let Some(code) = repo.code.as_ref() else {
+        return Err("code search unavailable for this repo".to_string());
+    };
+
+    let results = match search_chunks(
+        repo.embedder.as_ref(),
+        repo.store.as_ref(),
+        query,
+        limit * 3,
+        &filters,
+    )
+    .await
+    {
+        Ok(raw_results) => rerank_code_results(code.graph.as_ref(), raw_results, query, limit),
         Err(e) => return Err(format!("search failed: {}", e)),
     };
 
@@ -122,7 +128,7 @@ async fn handle_search(
     })
 }
 
-fn format_search_results(results: &[SearchResult]) -> String {
+fn format_search_results(results: &[CodeSearchResult]) -> String {
     let repo_path = std::env::current_dir().unwrap_or_default();
 
     if results.is_empty() {
@@ -165,13 +171,16 @@ async fn handle_graph(
     let (_, repo) = resolve_repo(state, args)?;
 
     // Try exact lookup first
-    let exact = repo.graph.get(symbol, file);
+    let Some(code) = repo.code.as_ref() else {
+        return Err("graph unavailable for this repo".to_string());
+    };
+    let exact = code.graph.get(symbol, file);
 
     // If no exact match, try fuzzy search
     let matches = if let Some(node) = exact {
         vec![node]
     } else {
-        repo.graph.search(symbol)
+        code.graph.search(symbol)
     };
 
     let text = if matches.is_empty() {
@@ -206,10 +215,10 @@ async fn handle_graph(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::code::{graph::Graph, models::CodeChunk, CodeRuntime};
     use crate::embedder::{EmbedMode, Embedder};
-    use crate::graph::Graph;
     use crate::mcp::state::RepoState;
-    use crate::models::Chunk;
+    use crate::models::IndexedChunk;
     use crate::store::Store;
     use anyhow::Result;
     use serde_json::json;
@@ -246,8 +255,8 @@ mod tests {
         let store = Arc::new(crate::store::edge::EdgeStore::new(&shard_path, "default"));
         store.init(4).await.unwrap();
         store
-            .upsert(
-                &[Chunk {
+            .upsert_indexed(
+                &[IndexedChunk::from(CodeChunk {
                     id: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string(),
                     content: "auth_service.dart AuthService.login\nFuture<void> login() async {}"
                         .to_string(),
@@ -258,7 +267,7 @@ mod tests {
                     line_end: 2,
                     kind: "method".to_string(),
                     meta: Default::default(),
-                }],
+                })],
                 &[vec![1.0, 0.0, 0.0, 0.0]],
             )
             .await
@@ -269,7 +278,9 @@ mod tests {
                 "bookswipe".to_string(),
                 RepoState {
                     store,
-                    graph: Arc::new(Graph::new()),
+                    code: Some(CodeRuntime {
+                        graph: Arc::new(Graph::new()),
+                    }),
                     embedder: Arc::new(FakeEmbedder),
                 },
             )]),

@@ -174,10 +174,10 @@ async fn handle_tools_call(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::code::{graph::Graph, models::CodeChunk, CodeRuntime};
     use crate::embedder::{EmbedMode, Embedder};
-    use crate::graph::Graph;
     use crate::mcp::state::RepoState;
-    use crate::models::Chunk;
+    use crate::models::IndexedChunk;
     use crate::store::edge::EdgeStore;
     use crate::store::Store;
     use anyhow::Result;
@@ -221,8 +221,8 @@ mod tests {
         std::env::temp_dir().join(format!("compas-mcp-test-{name}-{nanos}"))
     }
 
-    fn sample_chunk() -> Chunk {
-        Chunk {
+    fn sample_chunk() -> IndexedChunk {
+        CodeChunk {
             id: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string(),
             content: "auth_service.dart AuthService.login\nFuture<String> login() async {}"
                 .to_string(),
@@ -234,6 +234,7 @@ mod tests {
             kind: "method".to_string(),
             meta: Default::default(),
         }
+        .into()
     }
 
     #[tokio::test]
@@ -244,7 +245,7 @@ mod tests {
 
         let chunk = sample_chunk();
         store_impl
-            .upsert(&[chunk], &[vec![1.0, 0.0, 0.0, 0.0]])
+            .upsert_indexed(&[chunk], &[vec![1.0, 0.0, 0.0, 0.0]])
             .await
             .unwrap();
 
@@ -256,7 +257,7 @@ mod tests {
                 "test-repo".to_string(),
                 RepoState {
                     store: store_impl.clone() as Arc<dyn Store>,
-                    graph,
+                    code: Some(CodeRuntime { graph }),
                     embedder: Arc::new(FakeEmbedder),
                 },
             )]),

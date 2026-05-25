@@ -1,7 +1,7 @@
 #![allow(clippy::missing_transmute_annotations)]
 
 use crate::chunker::Chunker;
-use crate::models::Chunk;
+use crate::code::models::CodeChunk;
 use anyhow::Result;
 use std::collections::HashSet;
 use std::sync::OnceLock;
@@ -24,7 +24,7 @@ impl Chunker for DartChunker {
         "dart"
     }
 
-    fn chunk(&self, file_path: &str, content: &str) -> Result<Vec<Chunk>> {
+    fn chunk(&self, file_path: &str, content: &str) -> Result<Vec<CodeChunk>> {
         let mut parser = Parser::new();
         let language = unsafe {
             tree_sitter::Language::from_raw(std::mem::transmute::<
@@ -44,7 +44,7 @@ impl Chunker for DartChunker {
 
         if chunks.is_empty() {
             let lines: Vec<&str> = content.lines().collect();
-            chunks.push(Chunk {
+            chunks.push(CodeChunk {
                 id: Uuid::new_v4().to_string(),
                 content: truncate_content(content, MAX_CHUNK_CHARS),
                 language: "dart".into(),
@@ -80,7 +80,12 @@ fn init_parser() -> Result<Parser> {
     Ok(parser)
 }
 
-fn walk_top_level<'a>(root: &Node<'a>, content: &'a str, file_path: &str, chunks: &mut Vec<Chunk>) {
+fn walk_top_level<'a>(
+    root: &Node<'a>,
+    content: &'a str,
+    file_path: &str,
+    chunks: &mut Vec<CodeChunk>,
+) {
     let mut cursor = root.walk();
     for child in root.children(&mut cursor) {
         match child.kind() {
@@ -185,7 +190,7 @@ fn extract_class_members<'a>(
     class_node: Node<'a>,
     content: &'a str,
     file_path: &str,
-    chunks: &mut Vec<Chunk>,
+    chunks: &mut Vec<CodeChunk>,
 ) {
     let class_name = extract_name(class_node, content).unwrap_or_else(|| "AnonymousClass".into());
 
@@ -505,7 +510,7 @@ fn push_chunk(
     kind: &str,
     start_byte: usize,
     end_byte: usize,
-    chunks: &mut Vec<Chunk>,
+    chunks: &mut Vec<CodeChunk>,
 ) {
     let start_line = byte_to_line(content, start_byte);
     let end_line = byte_to_line(content, end_byte.min(content.len()));
@@ -530,7 +535,7 @@ fn push_chunk(
     };
 
     if enriched.len() <= MAX_CHUNK_CHARS {
-        chunks.push(Chunk {
+        chunks.push(CodeChunk {
             id: Uuid::new_v4().to_string(),
             content: enriched,
             language: "dart".into(),
@@ -552,7 +557,7 @@ fn push_chunk(
         let end = (offset + chunk_line_count).min(lines.len());
         let slice = lines[offset..end].join("\n");
         let clamped = truncate_content(&slice, MAX_CHUNK_CHARS);
-        chunks.push(Chunk {
+        chunks.push(CodeChunk {
             id: Uuid::new_v4().to_string(),
             content: clamped,
             language: "dart".into(),

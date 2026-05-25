@@ -1,7 +1,8 @@
 pub mod chunker;
+pub mod code;
 pub mod config;
 pub mod embedder;
-pub mod graph;
+pub mod indexing;
 pub mod mcp;
 pub mod middleware;
 pub mod models;
