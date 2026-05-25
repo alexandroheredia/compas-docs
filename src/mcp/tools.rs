@@ -303,4 +303,32 @@ mod tests {
 
         std::fs::remove_dir_all(shard_path).unwrap();
     }
+
+    #[tokio::test]
+    async fn search_codebase_returns_code_unavailable_for_document_repo() {
+        let state = McpAppState {
+            repos: HashMap::from([(
+                "docs".to_string(),
+                RepoState {
+                    store: Arc::new(crate::store::edge::EdgeStore::new(
+                        std::env::temp_dir().join("compas-mcp-docs-unused"),
+                        "default",
+                    )),
+                    code: None,
+                    embedder: Arc::new(FakeEmbedder),
+                },
+            )]),
+            default_repo: Some("docs".to_string()),
+        };
+
+        let error = handle_tool_call(
+            &state,
+            "search_codebase",
+            &json!({"query": "authentication", "repo": "docs", "limit": 5}),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error, "code search unavailable for this repo");
+    }
 }

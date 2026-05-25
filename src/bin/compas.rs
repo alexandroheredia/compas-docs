@@ -7,6 +7,7 @@ use compas::{
     },
     code::{graph::Graph, models::CodeChunk, CodeRuntime},
     config::AppConfig,
+    docs::indexing::DocumentIndexAdapter,
     embedder::build_embedder,
     indexing::{Indexer, IndexingAdapter},
     mcp::{self, state::McpAppState},
@@ -540,6 +541,7 @@ type MissingDocEntry = (String, String, String, usize);
 
 struct PreparedCodeFile {
     language: &'static str,
+    content: String,
     chunks: Vec<CodeChunk>,
     indexed_chunks: Vec<IndexedChunk>,
 }
@@ -600,19 +602,22 @@ impl IndexingAdapter for CodeIndexAdapter {
 
     fn prepare_file(
         &self,
-        file_path: &str,
-        content: &str,
+        path: &Path,
+        bytes: &[u8],
     ) -> anyhow::Result<Option<Self::PreparedFile>> {
-        let path = Path::new(file_path);
         let Some(language) = language_for_path(path) else {
             return Ok(None);
         };
+        let file_path = path.to_string_lossy().to_string();
+        let content = std::str::from_utf8(bytes)
+            .map_err(|e| anyhow::anyhow!("failed to decode source file as UTF-8: {}", e))?
+            .to_string();
 
         let chunker = self
             .registry
             .get(language)
             .ok_or_else(|| anyhow::anyhow!("no {} chunker available", language))?;
-        let chunks = chunker.chunk(file_path, content)?;
+        let chunks = chunker.chunk(&file_path, &content)?;
 
         for chunk in &chunks {
             let chunk_lines = chunk.line_end.saturating_sub(chunk.line_start);
@@ -628,6 +633,7 @@ impl IndexingAdapter for CodeIndexAdapter {
 
         Ok(Some(PreparedCodeFile {
             language,
+            content,
             chunks,
             indexed_chunks,
         }))
@@ -637,12 +643,7 @@ impl IndexingAdapter for CodeIndexAdapter {
         &prepared.indexed_chunks
     }
 
-    fn after_upsert(
-        &self,
-        file_path: &str,
-        content: &str,
-        prepared: &Self::PreparedFile,
-    ) -> anyhow::Result<()> {
+    fn after_upsert(&self, file_path: &str, prepared: &Self::PreparedFile) -> anyhow::Result<()> {
         self.graph.remove_by_file(file_path);
 
         for chunk in &prepared.chunks {
@@ -651,7 +652,7 @@ impl IndexingAdapter for CodeIndexAdapter {
                 .add_symbol(&base_symbol, &chunk.file_path, &chunk.kind);
         }
 
-        if let Ok(calls) = extract_calls_for_language(prepared.language, content) {
+        if let Ok(calls) = extract_calls_for_language(prepared.language, &prepared.content) {
             for (caller, callee) in &calls {
                 self.graph.add_symbol(caller, file_path, "method");
                 self.graph.add_call(caller, file_path, callee);
@@ -1017,6 +1018,36 @@ async fn index_repo(config: AppConfig) -> anyhow::Result<()> {
     ));
     store.init(embedder.dimensions()).await?;
 
+    if config.index.kind == "document" {
+        let adapter = DocumentIndexAdapter::new();
+        let indexer = Indexer::new(
+            &repo_path,
+            &config.repo.include,
+            &config.repo.exclude,
+            store.as_ref(),
+            embedder.as_ref(),
+        );
+        let report = indexer.index_repo(&adapter).await?;
+
+        print_index_summary(&repo_path, &report, None, None);
+
+        println!("Optimizing edge shard...");
+        let optimized = store.optimize()?;
+        if optimized {
+            println!("✓ Edge shard optimized");
+        } else {
+            println!("✓ Edge shard already optimized");
+        }
+
+        return Ok(());
+    }
+    if config.index.kind != "code" {
+        return Err(anyhow::anyhow!(
+            "unsupported index.kind '{}' ; expected 'code' or 'document'",
+            config.index.kind
+        ));
+    }
+
     let graph = Arc::new(Graph::new());
     let graph_path = repo_path.join(".compas").join("graph.json");
     if let Err(e) = graph.load(&graph_path) {
@@ -1069,7 +1100,30 @@ async fn index_repo(config: AppConfig) -> anyhow::Result<()> {
         report.failed_files,
     );
 
-    // ── Pretty summary ─────────────────────────────────────────────────────
+    print_index_summary(
+        &repo_path,
+        &report,
+        Some(chunks_without_docs.len()),
+        Some(dead_code_candidates.len()),
+    );
+
+    println!("Optimizing edge shard...");
+    let optimized = store.optimize()?;
+    if optimized {
+        println!("✓ Edge shard optimized");
+    } else {
+        println!("✓ Edge shard already optimized");
+    }
+
+    Ok(())
+}
+
+fn print_index_summary(
+    repo_path: &Path,
+    report: &compas::indexing::IndexingReport,
+    missing_docs: Option<usize>,
+    dead_code_count: Option<usize>,
+) {
     let secs = report.elapsed.as_secs();
     let mins = secs / 60;
     let rem_secs = secs % 60;
@@ -1083,8 +1137,6 @@ async fn index_repo(config: AppConfig) -> anyhow::Result<()> {
         .file_name()
         .map(|f| f.to_string_lossy().to_string())
         .unwrap_or_else(|| "repo".to_string());
-
-    let dead_code_count = dead_code_candidates.len();
 
     println!();
     println!("     @@@@@@@   @@@@@@   @@@@@@@@@@   @@@@@@@    @@@@@@    @@@@@@   ");
@@ -1110,30 +1162,21 @@ async fn index_repo(config: AppConfig) -> anyhow::Result<()> {
         report.total_chunks, report.failed_files
     );
     println!("    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    println!();
-    println!(
-        "    ⚠️  {} symbols missing doc comments",
-        chunks_without_docs.len()
-    );
-    println!("    🪦  {} dead code candidates", dead_code_count);
-    println!();
-    println!("    📊 Graph  → {}", graph_path.display());
-    println!("    📋 Audit  → .compas/audit.md");
-    println!();
+
+    if let (Some(missing_docs), Some(dead_code_count)) = (missing_docs, dead_code_count) {
+        let graph_path = repo_path.join(".compas").join("graph.json");
+        println!();
+        println!("    ⚠️  {} symbols missing doc comments", missing_docs);
+        println!("    🪦  {} dead code candidates", dead_code_count);
+        println!();
+        println!("    📊 Graph  → {}", graph_path.display());
+        println!("    📋 Audit  → .compas/audit.md");
+        println!();
+    }
 
     if !report.used_tui {
         info!("indexing complete");
     }
-
-    println!("Optimizing edge shard...");
-    let optimized = store.optimize()?;
-    if optimized {
-        println!("✓ Edge shard optimized");
-    } else {
-        println!("✓ Edge shard already optimized");
-    }
-
-    Ok(())
 }
 
 async fn optimize_repo(config: AppConfig) -> anyhow::Result<()> {
@@ -1208,17 +1251,22 @@ async fn run_mcp() -> anyhow::Result<()> {
         // MCP startup only loads repo descriptors. The shard is opened on demand
         // when a tool call actually targets this repo.
         let store: Arc<dyn compas::store::Store> = edge_store;
-        let graph = Arc::new(Graph::new());
-        let graph_path = repo_path.join(".compas").join("graph.json");
-        if let Err(e) = graph.load(&graph_path) {
-            warn!("no existing graph loaded for repo '{}': {}", name, e);
-        }
+        let code = if config.index.kind == "code" {
+            let graph = Arc::new(Graph::new());
+            let graph_path = repo_path.join(".compas").join("graph.json");
+            if let Err(e) = graph.load(&graph_path) {
+                warn!("no existing graph loaded for repo '{}': {}", name, e);
+            }
+            Some(CodeRuntime { graph })
+        } else {
+            None
+        };
 
         repos.insert(
             name.clone(),
             compas::mcp::state::RepoState {
                 store,
-                code: Some(CodeRuntime { graph }),
+                code,
                 embedder,
             },
         );
@@ -1291,18 +1339,23 @@ async fn serve() -> anyhow::Result<()> {
         // Daemon startup only loads repo descriptors. The shard is opened on
         // demand when a request actually targets this repo.
         let store: Arc<dyn compas::store::Store> = edge_store;
-        let graph = Arc::new(Graph::new());
-        let graph_path = repo_path.join(".compas").join("graph.json");
-        if let Err(e) = graph.load(&graph_path) {
-            warn!("no existing graph loaded for repo '{}': {}", name, e);
-        }
+        let code = if config.index.kind == "code" {
+            let graph = Arc::new(Graph::new());
+            let graph_path = repo_path.join(".compas").join("graph.json");
+            if let Err(e) = graph.load(&graph_path) {
+                warn!("no existing graph loaded for repo '{}': {}", name, e);
+            }
+            Some(CodeRuntime { graph })
+        } else {
+            None
+        };
 
         repos.insert(
             name.clone(),
             RepoState {
                 config,
                 store,
-                code: Some(CodeRuntime { graph }),
+                code,
                 embedder,
             },
         );
@@ -1360,6 +1413,12 @@ async fn serve() -> anyhow::Result<()> {
 }
 
 async fn watch(config: AppConfig) -> anyhow::Result<()> {
+    if config.index.kind == "document" {
+        return Err(anyhow::anyhow!(
+            "document watch mode is not implemented yet"
+        ));
+    }
+
     let repo_path = std::fs::canonicalize(&config.repo.path)?;
     let embedder = build_embedder(&config.embedder)?;
     let edge_store = Arc::new(EdgeStore::new(
@@ -1642,7 +1701,9 @@ fn strip_part_suffix(symbol: &str) -> String {
 mod tests {
     use super::*;
     use compas::indexing::should_include;
+    use compas::{docs::models::DocumentSearchResult, search::search_chunks};
     use serde_json::Value;
+    use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -2065,6 +2126,7 @@ mod tests {
                 port: "3001".into(),
             },
             index: compas::config::IndexConfig {
+                kind: "code".into(),
                 chunk_by: "function".into(),
                 watch: true,
             },
@@ -2077,6 +2139,168 @@ mod tests {
         let _ = optimize_edge_shard(&config).unwrap();
 
         std::fs::remove_dir_all(&repo_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_index_document_repo_and_search_chunks() {
+        let _guard = test_lock().lock().unwrap();
+
+        let repo_dir = unique_temp_path("document-repo");
+        std::fs::create_dir_all(repo_dir.join("docs")).unwrap();
+        std::fs::create_dir_all(repo_dir.join(".compas")).unwrap();
+
+        std::fs::write(
+            repo_dir.join("docs").join("guide.md"),
+            "# Auth Guide\n\nAuthentication overview.\n\n## Cache\n\nCache login tokens safely.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo_dir.join("docs").join("notes.txt"),
+            "Authentication notes.\n\nCache notes.",
+        )
+        .unwrap();
+        std::fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests")
+                .join("fixtures")
+                .join("documents")
+                .join("text-selectable-two-pages.pdf"),
+            repo_dir.join("docs").join("reference.pdf"),
+        )
+        .unwrap();
+
+        std::fs::write(
+            repo_dir.join("compas.yaml"),
+            r#"repo:
+  path: .
+  include:
+    - "**/*.md"
+    - "**/*.txt"
+    - "**/*.pdf"
+  exclude: []
+
+embedder:
+  provider: test
+  model: test
+
+store:
+  provider: edge
+  path: .compas/edge-shard
+  vector_name: default
+
+server:
+  host: 127.0.0.1
+  port: "3001"
+
+index:
+  kind: document
+  chunk_by: function
+  watch: false
+"#,
+        )
+        .unwrap();
+
+        let _cwd_guard = CurrentDirGuard::set(&repo_dir);
+
+        let config = AppConfig::load(repo_dir.join("compas.yaml").to_str().unwrap()).unwrap();
+        index_repo(config.clone()).await.unwrap();
+
+        let embedder = build_embedder(&config.embedder).unwrap();
+        let store = EdgeStore::new(repo_dir.join(&config.store.path), &config.store.vector_name);
+        let hits = search_chunks(
+            embedder.as_ref(),
+            &store,
+            "authentication",
+            10,
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
+
+        assert!(!hits.is_empty(), "expected document hits");
+
+        let results: Vec<DocumentSearchResult> = hits
+            .into_iter()
+            .map(DocumentSearchResult::try_from)
+            .collect::<Result<_, _>>()
+            .unwrap();
+
+        assert!(!results.is_empty());
+        assert!(results
+            .iter()
+            .all(|result| !result.chunk.file_name.is_empty()));
+        assert!(results
+            .iter()
+            .all(|result| { ["md", "txt", "pdf"].contains(&result.chunk.extension.as_str()) }));
+        assert!(
+            results.iter().any(|result| {
+                !result.chunk.heading_path.is_empty() || result.chunk.page_start.is_some()
+            }),
+            "expected at least one result with heading path or page metadata"
+        );
+        assert!(!repo_dir.join(".compas").join("graph.json").exists());
+        assert!(!repo_dir.join(".compas").join("audit.md").exists());
+        std::fs::remove_dir_all(&repo_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_document_watch_mode_is_explicitly_unsupported() {
+        let repo_dir = unique_temp_path("document-watch");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+
+        let config = AppConfig {
+            repo: compas::config::RepoConfig {
+                path: repo_dir.to_string_lossy().to_string(),
+                include: vec!["**/*.md".into()],
+                exclude: vec![],
+            },
+            embedder: compas::config::EmbedderConfig {
+                provider: "test".into(),
+                model: "test".into(),
+                query_prefix: None,
+                doc_prefix: None,
+            },
+            store: compas::config::StoreConfig {
+                provider: "edge".into(),
+                path: ".compas/edge-shard".into(),
+                vector_name: "default".into(),
+            },
+            server: compas::config::ServerConfig {
+                host: "127.0.0.1".into(),
+                port: "3001".into(),
+            },
+            index: compas::config::IndexConfig {
+                kind: "document".into(),
+                chunk_by: "function".into(),
+                watch: false,
+            },
+        };
+
+        let error = watch(config).await.unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "document watch mode is not implemented yet"
+        );
+
+        std::fs::remove_dir_all(&repo_dir).unwrap();
+    }
+
+    struct CurrentDirGuard {
+        original: PathBuf,
+    }
+
+    impl CurrentDirGuard {
+        fn set(path: &Path) -> Self {
+            let original = std::env::current_dir().unwrap();
+            std::env::set_current_dir(path).unwrap();
+            Self { original }
+        }
+    }
+
+    impl Drop for CurrentDirGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.original);
+        }
     }
 
     #[test]

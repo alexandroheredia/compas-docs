@@ -29,19 +29,21 @@ impl CompasIgnore {
         let path = repo_path.join(".compasignore");
         let mut matchers = Vec::new();
 
-        if let Ok(content) = std::fs::read_to_string(&path) {
-            for line in content.lines() {
-                let line = line.trim();
-                if line.is_empty() || line.starts_with('#') {
-                    continue;
-                }
-                if let Ok(glob) = globset::Glob::new(line) {
-                    matchers.push(glob.compile_matcher());
-                }
-                if line.ends_with('/') {
-                    let nested = format!("{}**", line);
-                    if let Ok(glob) = globset::Glob::new(&nested) {
+        if let Ok(bytes) = std::fs::read(&path) {
+            if let Ok(content) = std::str::from_utf8(&bytes) {
+                for line in content.lines() {
+                    let line = line.trim();
+                    if line.is_empty() || line.starts_with('#') {
+                        continue;
+                    }
+                    if let Ok(glob) = globset::Glob::new(line) {
                         matchers.push(glob.compile_matcher());
+                    }
+                    if line.ends_with('/') {
+                        let nested = format!("{}**", line);
+                        if let Ok(glob) = globset::Glob::new(&nested) {
+                            matchers.push(glob.compile_matcher());
+                        }
                     }
                 }
             }
@@ -88,14 +90,9 @@ pub trait IndexingAdapter: Send + Sync {
     type PreparedFile;
 
     fn supports_path(&self, path: &Path) -> bool;
-    fn prepare_file(&self, file_path: &str, content: &str) -> Result<Option<Self::PreparedFile>>;
+    fn prepare_file(&self, path: &Path, bytes: &[u8]) -> Result<Option<Self::PreparedFile>>;
     fn indexed_chunks<'a>(&self, prepared: &'a Self::PreparedFile) -> &'a [IndexedChunk];
-    fn after_upsert(
-        &self,
-        file_path: &str,
-        content: &str,
-        prepared: &Self::PreparedFile,
-    ) -> Result<()>;
+    fn after_upsert(&self, file_path: &str, prepared: &Self::PreparedFile) -> Result<()>;
     fn after_delete(&self, file_path: &str) -> Result<()>;
 }
 
@@ -166,15 +163,15 @@ impl<'a> Indexer<'a> {
                 continue;
             }
 
-            let content = match std::fs::read_to_string(path) {
-                Ok(content) => content,
+            let bytes = match std::fs::read(path) {
+                Ok(bytes) => bytes,
                 Err(e) => {
                     warn!("skip read error for {}: {}", path.display(), e);
                     continue;
                 }
             };
 
-            files_with_hashes.push((path.to_path_buf(), hash_bytes(content.as_bytes())));
+            files_with_hashes.push((path.to_path_buf(), hash_bytes(&bytes)));
         }
 
         let old_manifest = self.load_manifest();
@@ -271,8 +268,8 @@ impl<'a> Indexer<'a> {
                 info!("→ {}", rel_str);
             }
 
-            let content = match tokio::fs::read_to_string(path).await {
-                Ok(content) => content,
+            let bytes = match tokio::fs::read(path).await {
+                Ok(bytes) => bytes,
                 Err(e) => {
                     if let Some(ref bar) = progress {
                         bar.println(format!("⚠  skip read error in {}: {}", rel_str, e));
@@ -285,16 +282,7 @@ impl<'a> Indexer<'a> {
                 }
             };
 
-            let line_count = content.lines().count();
-            if line_count > 1000 {
-                if let Some(ref bar) = progress {
-                    bar.println(format!("⚠  large file: {} ({} lines)", rel_str, line_count));
-                } else {
-                    warn!("  ⚠️  large file: {} lines", line_count);
-                }
-            }
-
-            let prepared = match adapter.prepare_file(&path_str, &content) {
+            let prepared = match adapter.prepare_file(path, &bytes) {
                 Ok(Some(prepared)) => prepared,
                 Ok(None) => {
                     if let Some(ref bar) = progress {
@@ -375,7 +363,7 @@ impl<'a> Indexer<'a> {
                 continue;
             }
 
-            if let Err(e) = adapter.after_upsert(&path_str, &content, &prepared) {
+            if let Err(e) = adapter.after_upsert(&path_str, &prepared) {
                 if let Some(ref bar) = progress {
                     bar.println(format!("⚠  skip post-index error in {}: {}", rel_str, e));
                     bar.inc(1);
@@ -439,8 +427,8 @@ impl<'a> Indexer<'a> {
             return Ok(None);
         }
 
-        let content = tokio::fs::read_to_string(file_path).await?;
-        let prepared = match adapter.prepare_file(file_path, &content)? {
+        let bytes = tokio::fs::read(file_path).await?;
+        let prepared = match adapter.prepare_file(path, &bytes)? {
             Some(prepared) => prepared,
             None => return Ok(None),
         };
@@ -465,8 +453,8 @@ impl<'a> Indexer<'a> {
         self.store
             .upsert_indexed(adapter.indexed_chunks(&prepared), &embeddings)
             .await?;
-        adapter.after_upsert(file_path, &content, &prepared)?;
-        manifest.insert(file_path.to_string(), hash_bytes(content.as_bytes()));
+        adapter.after_upsert(file_path, &prepared)?;
+        manifest.insert(file_path.to_string(), hash_bytes(&bytes));
         self.save_manifest(&manifest).await?;
 
         Ok(Some(chunk_count))
@@ -514,8 +502,9 @@ impl<'a> Indexer<'a> {
     }
 
     fn load_manifest(&self) -> HashMap<String, String> {
-        std::fs::read_to_string(self.manifest_path())
+        std::fs::read(self.manifest_path())
             .ok()
+            .and_then(|bytes| String::from_utf8(bytes).ok())
             .and_then(|content| serde_json::from_str(&content).ok())
             .unwrap_or_default()
     }
@@ -549,5 +538,137 @@ impl<'a> Indexer<'a> {
         }
 
         Ok(embeddings)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::embedder::{EmbedMode, Embedder};
+    use crate::models::SearchHit;
+    use anyhow::{anyhow, Result};
+    use std::sync::{Arc, Mutex};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct RecordingAdapter {
+        seen_bytes: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl IndexingAdapter for RecordingAdapter {
+        type PreparedFile = Vec<IndexedChunk>;
+
+        fn supports_path(&self, path: &Path) -> bool {
+            path.extension().and_then(|ext| ext.to_str()) == Some("pdf")
+        }
+
+        fn prepare_file(&self, path: &Path, bytes: &[u8]) -> Result<Option<Self::PreparedFile>> {
+            *self.seen_bytes.lock().unwrap() = bytes.to_vec();
+
+            Ok(Some(vec![IndexedChunk {
+                id: "doc-1".to_string(),
+                content: "binary document body".to_string(),
+                file_path: path.to_string_lossy().to_string(),
+                kind: "page".to_string(),
+                metadata: HashMap::new(),
+            }]))
+        }
+
+        fn indexed_chunks<'a>(&self, prepared: &'a Self::PreparedFile) -> &'a [IndexedChunk] {
+            prepared
+        }
+
+        fn after_upsert(&self, _file_path: &str, _prepared: &Self::PreparedFile) -> Result<()> {
+            Ok(())
+        }
+
+        fn after_delete(&self, _file_path: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    struct FakeEmbedder;
+
+    #[async_trait::async_trait]
+    impl Embedder for FakeEmbedder {
+        async fn embed(&self, _text: &str, _mode: EmbedMode) -> Result<Vec<f32>> {
+            Ok(vec![1.0, 0.0, 0.0, 0.0])
+        }
+
+        async fn embed_batch(&self, texts: &[String], _mode: EmbedMode) -> Result<Vec<Vec<f32>>> {
+            Ok(texts.iter().map(|_| vec![1.0, 0.0, 0.0, 0.0]).collect())
+        }
+
+        fn dimensions(&self) -> usize {
+            4
+        }
+    }
+
+    struct MemoryStore {
+        upserts: Arc<Mutex<Vec<IndexedChunk>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Store for MemoryStore {
+        async fn init(&self, _vector_size: usize) -> Result<()> {
+            Ok(())
+        }
+
+        async fn upsert_indexed(
+            &self,
+            chunks: &[IndexedChunk],
+            _embeddings: &[Vec<f32>],
+        ) -> Result<()> {
+            self.upserts.lock().unwrap().extend_from_slice(chunks);
+            Ok(())
+        }
+
+        async fn search_indexed(
+            &self,
+            _embedding: &[f32],
+            _limit: usize,
+            _filters: &HashMap<String, String>,
+        ) -> Result<Vec<SearchHit>> {
+            Err(anyhow!("search is not used in this test"))
+        }
+
+        async fn delete_by_file(&self, _file_path: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn indexer_supports_binary_file_inputs_via_adapter() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let repo_path = std::env::temp_dir().join(format!("compas-indexer-bytes-{nanos}"));
+        std::fs::create_dir_all(&repo_path).unwrap();
+        std::fs::create_dir_all(repo_path.join(".compas")).unwrap();
+
+        let file_path = repo_path.join("sample.pdf");
+        let bytes = vec![0x25, 0x50, 0x44, 0x46, 0xff, 0x00, 0xfe, 0x41];
+        std::fs::write(&file_path, &bytes).unwrap();
+
+        let seen_bytes = Arc::new(Mutex::new(Vec::new()));
+        let upserts = Arc::new(Mutex::new(Vec::new()));
+        let adapter = RecordingAdapter {
+            seen_bytes: Arc::clone(&seen_bytes),
+        };
+        let store = MemoryStore {
+            upserts: Arc::clone(&upserts),
+        };
+        let embedder = FakeEmbedder;
+        let include = ["**/*.pdf".to_string()];
+        let exclude: [String; 0] = [];
+        let indexer = Indexer::new(&repo_path, &include, &exclude, &store, &embedder);
+
+        let report = indexer.index_repo(&adapter).await.unwrap();
+
+        assert_eq!(*seen_bytes.lock().unwrap(), bytes);
+        assert_eq!(upserts.lock().unwrap().len(), 1);
+        assert_eq!(report.processed_files, 1);
+
+        std::fs::remove_dir_all(repo_path).unwrap();
     }
 }

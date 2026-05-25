@@ -158,6 +158,7 @@ mod tests {
                 host: "127.0.0.1".to_string(),
             },
             index: IndexConfig {
+                kind: "code".to_string(),
                 chunk_by: "function".to_string(),
                 watch: true,
             },
@@ -347,6 +348,7 @@ mod search_shape_tests {
                 host: "127.0.0.1".to_string(),
             },
             index: crate::config::IndexConfig {
+                kind: "code".to_string(),
                 chunk_by: "function".to_string(),
                 watch: true,
             },
@@ -425,5 +427,35 @@ mod search_shape_tests {
         assert_eq!(first["line_start"], Value::from(10));
         assert_eq!(first["line_end"], Value::from(18));
         assert_eq!(first["type"], Value::String("method".to_string()));
+    }
+
+    #[tokio::test]
+    async fn search_handler_returns_code_unavailable_for_document_repo() {
+        let state = Arc::new(AppState {
+            repos: HashMap::from([(
+                "docs".to_string(),
+                RepoState {
+                    config: sample_config(),
+                    store: Arc::new(StaticSearchStore { hits: vec![] }),
+                    code: None,
+                    embedder: Arc::new(FakeSearchEmbedder),
+                },
+            )]),
+            default_repo: Some("docs".to_string()),
+        });
+
+        let Json(value) = search_handler(
+            Query(HashMap::from([
+                ("repo".to_string(), "docs".to_string()),
+                ("q".to_string(), "authentication".to_string()),
+            ])),
+            axum::extract::State(state),
+        )
+        .await;
+
+        assert_eq!(
+            value,
+            json!({"error": "code search unavailable for this repo"})
+        );
     }
 }

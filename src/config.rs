@@ -48,6 +48,8 @@ pub struct ServerConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexConfig {
+    #[serde(default)]
+    pub kind: String,
     pub chunk_by: String,
     pub watch: bool,
 }
@@ -82,6 +84,9 @@ impl AppConfig {
         }
         if cfg.server.host.is_empty() {
             cfg.server.host = "127.0.0.1".into();
+        }
+        if cfg.index.kind.is_empty() {
+            cfg.index.kind = "code".into();
         }
         if cfg.index.chunk_by.is_empty() {
             cfg.index.chunk_by = "function".into();
