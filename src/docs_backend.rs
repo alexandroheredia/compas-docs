@@ -36,7 +36,10 @@ pub struct FolderRegistry {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SearchDocumentItem {
+    pub folder_id: String,
+    pub folder_name: String,
     pub file_path: String,
+    pub absolute_path: String,
     pub title: String,
     pub section: String,
     pub page: String,
@@ -282,7 +285,10 @@ pub async fn search_documents(
             .into_iter()
             .filter(|folder| folder.id == id)
             .collect(),
-        None => folders,
+        None => folders
+            .into_iter()
+            .filter(|folder| folder.last_indexed_at.is_some())
+            .collect(),
     };
 
     let mut results = Vec::new();
@@ -311,7 +317,10 @@ pub async fn search_documents(
             };
 
             results.push(SearchDocumentItem {
+                folder_id: folder.id.clone(),
+                folder_name: folder.display_name.clone(),
                 file_path: rel_file,
+                absolute_path: result.chunk.file_path,
                 title: result.chunk.title,
                 section,
                 page,
@@ -455,7 +464,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(results.len(), 1);
+        assert_eq!(results[0].folder_id, record.id);
+        assert_eq!(results[0].folder_name, record.display_name);
         assert_eq!(results[0].file_path, "docs/policy.md");
+        assert!(results[0].absolute_path.ends_with("docs/policy.md"));
         assert_eq!(results[0].title, "Insurance Policy");
         assert_eq!(results[0].page, "n/a");
 
