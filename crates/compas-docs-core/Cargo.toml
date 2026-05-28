@@ -1,0 +1,28 @@
+[package]
+name = "compas-docs-core"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+dirs = "5"
+fastembed = "5"
+globset = "0.4"
+hnsw_rs = "0.3.4"
+pdf-extract = "0.10"
+pulldown-cmark = "0.13"
+rusqlite = { version = "0.31", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tantivy = "0.26.1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs"] }
+tracing = "0.1"
+uuid = { version = "1", features = ["v4"] }
+walkdir = "2"
+
+[dev-dependencies]
+tempfile = "3"

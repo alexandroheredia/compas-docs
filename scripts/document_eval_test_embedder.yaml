@@ -1,0 +1,25 @@
+repo:
+  path: .
+  include:
+    - "**/*.md"
+    - "**/*.txt"
+    - "**/*.pdf"
+  exclude: []
+
+embedder:
+  provider: test
+  model: test
+
+store:
+  provider: document-hybrid
+  path: .compas/edge-shard
+  vector_name: default
+
+server:
+  host: 127.0.0.1
+  port: "3001"
+
+index:
+  kind: document
+  chunk_by: function
+  watch: false

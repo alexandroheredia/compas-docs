@@ -6,15 +6,18 @@
   "build": {
     "frontendDist": "../app/dist",
     "devUrl": "http://localhost:5173",
-    "beforeDevCommand": "cd ../app && bun run dev",
-    "beforeBuildCommand": "cd ../app && bun run build"
+    "beforeDevCommand": "cd app && bun run dev",
+    "beforeBuildCommand": "cd app && bun run build"
   },
   "app": {
     "windows": [
       {
+        "label": "main",
         "title": "Compas Docs",
-        "width": 800,
-        "height": 600,
+        "width": 1180,
+        "height": 860,
+        "minWidth": 820,
+        "minHeight": 640,
         "resizable": true,
         "fullscreen": false
       }

@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "src-tauri"]
+members = [".", "src-tauri", "crates/compas-docs-core"]
 resolver = "2"
 
 [package]
@@ -44,3 +44,4 @@ qdrant-edge = "0.6.1"
 fastembed = "5"
 pdf-extract = "0.10"
 pulldown-cmark = "0.13"
+compas-docs-core = { path = "crates/compas-docs-core" }

@@ -27,4 +27,12 @@
 # Common editor settings
 .idea/
 .vscode/
-/tests
+
+# Local browser automation artifacts
+/.playwright-mcp/
+/playwright-report/
+/test-results/
+
+# TypeScript incremental build metadata
+*.tsbuildinfo
+/.evals

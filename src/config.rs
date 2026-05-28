@@ -71,7 +71,11 @@ impl AppConfig {
             cfg.embedder.model = "nomic-ai/nomic-embed-text-v1.5".into();
         }
         if cfg.store.provider.is_empty() {
-            cfg.store.provider = "edge".into();
+            cfg.store.provider = if cfg.index.kind == "document" {
+                "document-hybrid".into()
+            } else {
+                "edge".into()
+            };
         }
         if cfg.store.path.is_empty() {
             cfg.store.path = ".compas/edge-shard".into();

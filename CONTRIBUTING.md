@@ -115,6 +115,17 @@ The evaluation script runs 13 queries with gold-standard expected files. P@5 sho
 
 If you don't have a suitable repo, use any open source Flutter project (e.g., [flutter/samples](https://github.com/flutter/samples)) as a test fixture.
 
+### Document Search Evaluation
+
+For document-mode relevance changes, use the document evaluator and compare scores before and after the change:
+
+```bash
+python3 scripts/evaluate_document_search.py --binary ./target/release/compas --cases scripts/document_eval_cases.example.json
+```
+
+The cases file is intentionally editable. Point `folder` at the corpus you want to benchmark and keep the query set representative of the search behaviors you care about.
+Each run is logged automatically under `.evals/document-search/` with the binary path, file hashes, config hash, environment settings, and scores so regressions can be compared later.
+
 ## Architecture Notes
 
 - **Config:** `compas.yaml` in repo root. `AppConfig::load()` reads it.

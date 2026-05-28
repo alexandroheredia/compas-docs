@@ -1,0 +1,184 @@
+{
+  "folder": "../tests/fixtures/document-eval",
+  "limit": 10,
+  "cases": [
+    {
+      "name": "cross-lingual spanish train station",
+      "query": "where is the train station",
+      "domain": "personal",
+      "language": "en->es",
+      "difficulty": "hard",
+      "expected_files": [
+        "personal/learning/spanish_phrases.md"
+      ],
+      "description": "English query should find the Spanish travel phrase document."
+    },
+    {
+      "name": "cross-lingual spanish lost passport",
+      "query": "I lost my passport",
+      "domain": "personal",
+      "language": "en->es",
+      "difficulty": "hard",
+      "expected_files": [
+        "personal/learning/spanish_phrases.md"
+      ],
+      "description": "English emergency query should retrieve the Spanish emergency phrase."
+    },
+    {
+      "name": "cross-lingual french museum tickets",
+      "query": "museum skip the line tickets",
+      "domain": "personal",
+      "language": "en->fr",
+      "difficulty": "hard",
+      "expected_files": [
+        "personal/learning/french_museum_notes.md"
+      ],
+      "description": "English museum booking query against a French note."
+    },
+    {
+      "name": "cross-lingual german bike noise",
+      "query": "bike chain noise under load",
+      "domain": "personal",
+      "language": "en->de",
+      "difficulty": "hard",
+      "expected_files": [
+        "personal/learning/german_bike_maintenance.md"
+      ],
+      "description": "English bike-maintenance query against a German note."
+    },
+    {
+      "name": "cross-lingual spanish hotel check-in",
+      "query": "hotel check in reservation",
+      "domain": "personal",
+      "language": "en->es",
+      "difficulty": "hard",
+      "expected_files": [
+        "personal/learning/spanish_phrases.md"
+      ],
+      "description": "English travel query against Spanish hotel phrases."
+    },
+    {
+      "name": "cross-lingual german source query",
+      "query": "was soll ich prüfen wenn die Schaltung unter Last knackt",
+      "domain": "personal",
+      "language": "de",
+      "difficulty": "medium",
+      "expected_files": [
+        "personal/learning/german_bike_maintenance.md"
+      ],
+      "description": "Native-language German retrieval sanity check."
+    },
+    {
+      "name": "cross-lingual french source query",
+      "query": "comment réserver des billets coupe-file pour le musée",
+      "domain": "personal",
+      "language": "fr",
+      "difficulty": "medium",
+      "expected_files": [
+        "personal/learning/french_museum_notes.md"
+      ],
+      "description": "Native-language French retrieval sanity check."
+    },
+    {
+      "name": "cross-lingual spanish source query",
+      "query": "frase en español para decir que he perdido mi pasaporte",
+      "domain": "personal",
+      "language": "es",
+      "difficulty": "medium",
+      "expected_files": [
+        "personal/learning/spanish_phrases.md"
+      ],
+      "description": "Native-language Spanish retrieval sanity check."
+    },
+    {
+      "name": "four day schedule bug",
+      "query": "30 hours over four days wrong time balance and incorrect payroll totals",
+      "domain": "work",
+      "language": "en",
+      "difficulty": "hard",
+      "expected_files": [
+        "product/four_day_schedule_research.md",
+        "product/week_pattern_migration_plan.md"
+      ],
+      "description": "Semantic retrieval across a problem analysis and migration plan."
+    },
+    {
+      "name": "backup and pitr strategy",
+      "query": "backup point in time recovery restore drill and archive export differences",
+      "domain": "work",
+      "language": "en",
+      "difficulty": "medium",
+      "expected_files": [
+        "operations/backup_strategy_overview.md",
+        "glossary/acronyms_and_terms.md"
+      ],
+      "description": "Mixes recovery concepts with acronym expansion."
+    },
+    {
+      "name": "pii logging audit",
+      "query": "email logging in debug output and sentry user context privacy audit",
+      "domain": "work",
+      "language": "en",
+      "difficulty": "medium",
+      "expected_files": [
+        "security/pii_logging_audit.md"
+      ],
+      "description": "Privacy-focused logging query with specific risky terms."
+    },
+    {
+      "name": "csp vs privacy distractor",
+      "query": "content security policy headers for the web dashboard",
+      "domain": "work",
+      "language": "en",
+      "difficulty": "medium",
+      "expected_files": [
+        "security/csp_header_notes.md"
+      ],
+      "description": "Should prefer the CSP note over the dashboard-copy distractor."
+    },
+    {
+      "name": "quick dinner rotation",
+      "query": "what are the fast dinners and batch cooking ideas for the week",
+      "domain": "personal",
+      "language": "en",
+      "difficulty": "easy",
+      "expected_files": [
+        "personal/family/weekly_meal_rotation.md"
+      ],
+      "description": "Personal household retrieval with non-obvious distractors nearby."
+    },
+    {
+      "name": "sourdough cold proof",
+      "query": "how many stretch and fold rounds before an overnight cold proof",
+      "domain": "personal",
+      "language": "en",
+      "difficulty": "hard",
+      "expected_files": [
+        "personal/cooking/sourdough_schedule.md"
+      ],
+      "description": "Recipe-process retrieval with a shopping-note distractor in the corpus."
+    },
+    {
+      "name": "window fogging maintenance",
+      "query": "what should I record before contacting the building manager about a foggy window",
+      "domain": "personal",
+      "language": "en",
+      "difficulty": "medium",
+      "expected_files": [
+        "personal/home/apartment_maintenance_log.md"
+      ],
+      "description": "Home-maintenance retrieval rather than work documentation."
+    },
+    {
+      "name": "gift ideas memory over generic candles",
+      "query": "avoid last minute generic candles and choose a more personal shared memory gift",
+      "domain": "personal",
+      "language": "en",
+      "difficulty": "medium",
+      "expected_files": [
+        "personal/family/gift_ideas_board.md"
+      ],
+      "description": "Personal planning note with a strong phrasing cue."
+    }
+  ]
+}

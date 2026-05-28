@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use compas::{
     chunker::{
         dart::extract_semantic_references, extract_calls_for_language, language_for_path,
@@ -16,7 +16,7 @@ use compas::{
     docs_backend::{
         add_folder, default_document_config, document_storage_paths, index_folder, list_folders,
         normalize_document_storage, open_document, remove_folder, resolved_store_path,
-        reveal_in_finder, search_documents,
+        reveal_in_finder, search_documents, stable_folder_id, SearchDocumentItem,
     },
     embedder::build_embedder,
     indexing::{Indexer, IndexingAdapter},
@@ -32,6 +32,18 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tracing::{debug, info, warn};
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum SearchOutputFormat {
+    Text,
+    Json,
+}
+
+#[derive(serde::Serialize)]
+struct SearchOutput<T> {
+    query: String,
+    results: Vec<T>,
+}
 
 const FLUTTER_LIFECYCLE_METHODS: &[&str] = &[
     "build",
@@ -176,6 +188,9 @@ enum Commands {
         /// Maximum number of results to return
         #[arg(long, default_value_t = 10)]
         limit: usize,
+        /// Output format
+        #[arg(long, value_enum, default_value_t = SearchOutputFormat::Text)]
+        format: SearchOutputFormat,
     },
     /// Add a folder to the central document library
     AddFolder { path: PathBuf },
@@ -216,22 +231,45 @@ async fn main() -> anyhow::Result<()> {
                 index_repo(config).await
             }
         }
-        Commands::Search { query, path, limit } => {
+        Commands::Search {
+            query,
+            path,
+            limit,
+            format,
+        } => {
             let config = load_command_config(&cli.config, path.as_deref())?;
             if config.index.kind == "document" && path.is_none() {
-                for result in search_documents(&query, None, limit, config).await? {
-                    println!(
-                        "{}\n  Title: {}\n  Section: {}\n  Page: {}\n  Score: {:.3}\n  Preview: {}\n",
-                        result.file_path,
-                        result.title,
-                        result.section,
-                        result.page,
-                        result.score,
-                        result.preview
-                    );
+                let results = search_documents(&query, None, limit, config).await?;
+                match format {
+                    SearchOutputFormat::Text => {
+                        for result in results {
+                            println!(
+                                "{}\n  Title: {}\n  Section: {}\n  Page: {}\n  Score: {:.3}\n  Preview: {}\n",
+                                result.file_path,
+                                result.title,
+                                result.section,
+                                result.page,
+                                result.score,
+                                result.preview
+                            );
+                        }
+                    }
+                    SearchOutputFormat::Json => {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&SearchOutput { query, results })?
+                        );
+                    }
                 }
             } else {
-                println!("{}", search_repo(config, &query, limit).await?);
+                match format {
+                    SearchOutputFormat::Text => {
+                        println!("{}", search_repo(config, &query, limit).await?);
+                    }
+                    SearchOutputFormat::Json => {
+                        println!("{}", search_repo_json(config, &query, limit).await?);
+                    }
+                }
             }
             Ok(())
         }
@@ -292,6 +330,49 @@ fn load_command_config(
 }
 
 async fn search_repo(config: AppConfig, query: &str, limit: usize) -> anyhow::Result<String> {
+    let repo_path = std::fs::canonicalize(&config.repo.path)?;
+    let json = search_repo_json(config, query, limit).await?;
+    let parsed: serde_json::Value = serde_json::from_str(&json)?;
+
+    match parsed.get("kind").and_then(|kind| kind.as_str()) {
+        Some("code") => {
+            let results: Vec<CodeSearchResult> = serde_json::from_value(
+                parsed
+                    .get("results")
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("search output missing results"))?,
+            )?;
+            Ok(format_code_search_results(&results, &repo_path))
+        }
+        Some("document") => {
+            let results: Vec<SearchDocumentItem> = serde_json::from_value(
+                parsed
+                    .get("results")
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("search output missing results"))?,
+            )?;
+            Ok(format_document_search_results(&results, &repo_path))
+        }
+        Some(other) => Err(anyhow::anyhow!(
+            "unsupported search output kind '{}'",
+            other
+        )),
+        None => Err(anyhow::anyhow!("search output missing kind")),
+    }
+}
+
+async fn search_repo_json(config: AppConfig, query: &str, limit: usize) -> anyhow::Result<String> {
+    if config.index.kind == "document" {
+        let repo_path = std::fs::canonicalize(&config.repo.path)?;
+        let folder_id = stable_folder_id(&repo_path);
+        let results = search_documents(query, Some(&folder_id), limit, config).await?;
+        return Ok(serde_json::to_string_pretty(&serde_json::json!({
+            "kind": "document",
+            "query": query,
+            "results": results,
+        }))?);
+    }
+
     let embedder = build_embedder(&config.embedder)?;
     let repo_path = std::fs::canonicalize(&config.repo.path)?;
     let store = EdgeStore::new(
@@ -311,7 +392,7 @@ async fn search_repo(config: AppConfig, query: &str, limit: usize) -> anyhow::Re
     )
     .await?;
 
-    match config.index.kind.as_str() {
+    let payload = match config.index.kind.as_str() {
         "code" => {
             let graph = Arc::new(Graph::new());
             let graph_path = repo_path.join(".compas").join("graph.json");
@@ -320,20 +401,30 @@ async fn search_repo(config: AppConfig, query: &str, limit: usize) -> anyhow::Re
             }
 
             let results = rerank_code_results(graph.as_ref(), raw_results, query, limit);
-            Ok(format_code_search_results(&results, &repo_path))
+            serde_json::json!({
+                "kind": "code",
+                "query": query,
+                "results": results,
+            })
         }
         "document" => {
             let results = raw_results
                 .into_iter()
                 .map(DocumentSearchResult::try_from)
                 .collect::<anyhow::Result<Vec<_>>>()?;
-            Ok(format_document_search_results(&results, &repo_path))
+            serde_json::json!({
+                "kind": "document",
+                "query": query,
+                "results": results,
+            })
         }
         other => Err(anyhow::anyhow!(
             "unsupported index.kind '{}' ; expected 'code' or 'document'",
             other
-        )),
-    }
+        ))?,
+    };
+
+    Ok(serde_json::to_string_pretty(&payload)?)
 }
 
 fn format_code_search_results(results: &[CodeSearchResult], repo_path: &Path) -> String {
@@ -364,7 +455,7 @@ fn format_code_search_results(results: &[CodeSearchResult], repo_path: &Path) ->
     lines.join("\n")
 }
 
-fn format_document_search_results(results: &[DocumentSearchResult], repo_path: &Path) -> String {
+fn format_document_search_results(results: &[SearchDocumentItem], repo_path: &Path) -> String {
     if results.is_empty() {
         return "No relevant documents found.".to_string();
     }
@@ -374,37 +465,24 @@ fn format_document_search_results(results: &[DocumentSearchResult], repo_path: &
         results.len()
     )];
     for (index, result) in results.iter().enumerate() {
-        let rel_path = Path::new(&result.chunk.file_path)
+        let rel_path = Path::new(&result.file_path)
             .strip_prefix(repo_path)
             .map(|path| path.to_string_lossy().to_string())
-            .unwrap_or_else(|_| result.chunk.file_path.clone());
-        let section = if result.chunk.heading_path.is_empty() {
-            "(root)".to_string()
-        } else {
-            result.chunk.heading_path.join(" > ")
-        };
+            .unwrap_or_else(|_| result.file_path.clone());
 
         lines.push(format!(
             "\n{}. {}\n   Title: {}\n   Section: {}\n   Page: {}\n   Score: {:.3}\n   Preview: {}",
             index + 1,
             rel_path,
-            result.chunk.title,
-            section,
-            display_page_range(result.chunk.page_start, result.chunk.page_end),
+            result.title,
+            result.section,
+            result.page,
             result.score,
-            result.chunk.preview
+            result.preview
         ));
     }
 
     lines.join("\n")
-}
-
-fn display_page_range(page_start: Option<usize>, page_end: Option<usize>) -> String {
-    match (page_start, page_end) {
-        (Some(start), Some(end)) if start != end => format!("{}-{}", start, end),
-        (Some(start), _) => start.to_string(),
-        _ => "n/a".to_string(),
-    }
 }
 
 fn init_repo() -> anyhow::Result<()> {
@@ -2567,8 +2645,7 @@ index:
         let _cwd_guard = CurrentDirGuard::set(&repo_dir);
         let _env_guard = EnvVarGuard::set("COMPAS_DOCS_HOME", &library_dir);
         let storage = document_storage_paths(&repo_dir);
-        index_repo(config.clone()).await.unwrap();
-        add_folder(&repo_dir).unwrap();
+        index_folder(&repo_dir, config.clone()).await.unwrap();
 
         let output = search_repo(config, "renewal date", 5).await.unwrap();
 
