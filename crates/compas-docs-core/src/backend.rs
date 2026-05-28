@@ -29,7 +29,7 @@ pub fn default_document_config(path: &Path) -> AppConfig {
         },
         embedder: EmbedderConfig {
             provider: "fastembed".into(),
-            model: "nomic-ai/nomic-embed-text-v1.5".into(),
+            model: "nomic-embed-text-v1.5-q".into(),
             query_prefix: None,
             doc_prefix: None,
         },

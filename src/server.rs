@@ -144,7 +144,7 @@ mod tests {
             },
             embedder: EmbedderConfig {
                 provider: "fastembed".to_string(),
-                model: "nomic-ai/nomic-embed-text-v1.5".to_string(),
+                model: "nomic-embed-text-v1.5-q".to_string(),
                 query_prefix: None,
                 doc_prefix: None,
             },
@@ -334,7 +334,7 @@ mod search_shape_tests {
             },
             embedder: crate::config::EmbedderConfig {
                 provider: "fastembed".to_string(),
-                model: "nomic-ai/nomic-embed-text-v1.5".to_string(),
+                model: "nomic-embed-text-v1.5-q".to_string(),
                 query_prefix: None,
                 doc_prefix: None,
             },

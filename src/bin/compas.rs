@@ -606,7 +606,7 @@ fn init_repo() -> anyhow::Result<()> {
 
 embedder:
   provider: fastembed
-  model: nomic-ai/nomic-embed-text-v1.5
+  model: nomic-embed-text-v1.5-q
 
 store:
   provider: edge
@@ -2341,7 +2341,7 @@ mod tests {
         let config_text = std::fs::read_to_string(&config_path).unwrap();
         let updated = config_text
             .replace("provider: fastembed", "provider: test")
-            .replace("model: nomic-ai/nomic-embed-text-v1.5", "model: test");
+            .replace("model: nomic-embed-text-v1.5-q", "model: test");
         std::fs::write(&config_path, updated).unwrap();
 
         let config = AppConfig::load(config_path.to_str().unwrap()).unwrap();
@@ -2423,7 +2423,7 @@ mod tests {
             },
             embedder: compas::config::EmbedderConfig {
                 provider: "fastembed".into(),
-                model: "nomic-ai/nomic-embed-text-v1.5".into(),
+                model: "nomic-embed-text-v1.5-q".into(),
                 query_prefix: None,
                 doc_prefix: None,
             },

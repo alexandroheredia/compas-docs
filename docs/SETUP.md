@@ -60,7 +60,7 @@ ls -la target/release/compas
 The binary path is: `{repo_root}/target/release/compas`
 (Example: `/Users/yourname/GitHub/compas/target/release/compas`)
 
-> **Note:** The embedding model (`nomic-ai/nomic-embed-text-v1.5`) downloads automatically on first `compas index` via FastEmbed. No manual model setup is required.
+> **Note:** The embedding model (`nomic-embed-text-v1.5-q`) downloads automatically on first `compas index` via FastEmbed. No manual model setup is required.
 
 ### Step 2: Configure MCP in the Editor
 

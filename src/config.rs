@@ -68,7 +68,7 @@ impl AppConfig {
             cfg.embedder.provider = "fastembed".into();
         }
         if cfg.embedder.model.is_empty() {
-            cfg.embedder.model = "nomic-ai/nomic-embed-text-v1.5".into();
+            cfg.embedder.model = "nomic-embed-text-v1.5-q".into();
         }
         if cfg.store.provider.is_empty() {
             cfg.store.provider = if cfg.index.kind == "document" {

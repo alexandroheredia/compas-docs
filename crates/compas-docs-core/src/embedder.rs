@@ -94,7 +94,6 @@ fn configure_fastembed_runtime() {
 
 fn parse_model(model: &str) -> Result<EmbeddingModel> {
     match normalize_model_name(model).as_str() {
-        "nomicainomicembedtextv15" | "nomicembedtextv15" => Ok(EmbeddingModel::NomicEmbedTextV15),
         "nomicainomicembedtextv15q" | "nomicembedtextv15q" => {
             Ok(EmbeddingModel::NomicEmbedTextV15Q)
         }
@@ -224,14 +223,10 @@ mod tests {
     }
 
     #[test]
-    fn parse_model_accepts_nomic_aliases() {
+    fn parse_model_accepts_quantized_nomic_aliases() {
         assert_eq!(
-            parse_model("nomic-embed-text-v1.5").unwrap(),
-            EmbeddingModel::NomicEmbedTextV15
-        );
-        assert_eq!(
-            parse_model("nomic-ai/nomic-embed-text-v1.5").unwrap(),
-            EmbeddingModel::NomicEmbedTextV15
+            parse_model("nomic-ai/nomic-embed-text-v1.5-q").unwrap(),
+            EmbeddingModel::NomicEmbedTextV15Q
         );
         assert_eq!(
             parse_model("nomic-embed-text-v1.5-q").unwrap(),
