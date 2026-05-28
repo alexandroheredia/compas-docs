@@ -35,3 +35,17 @@ export type LibraryStats = {
 }
 
 export type StatusTone = 'idle' | 'busy' | 'error'
+
+export type IndexPhase = 'started' | 'file' | 'finalizing' | 'completed' | 'failed'
+
+export type IndexFileStatus = 'indexed' | 'skipped' | 'failed'
+
+export type IndexProgressEvent = {
+  folderId: string
+  phase: IndexPhase
+  processedFiles: number
+  totalFiles: number
+  currentPath?: string | null
+  fileStatus?: IndexFileStatus | null
+  error?: string | null
+}

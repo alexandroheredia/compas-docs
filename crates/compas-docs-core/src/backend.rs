@@ -22,6 +22,48 @@ use tracing::{debug, info, warn};
 
 pub use crate::models::{FolderRecord, LibraryStats, SearchDocumentItem};
 
+/// Progress events emitted while indexing a folder so UIs can render real progress
+/// instead of a generic spinner. Kept as a small enum so we can extend it without
+/// breaking the Tauri event contract.
+#[derive(Debug, Clone)]
+pub enum IndexProgress {
+    /// Indexing started; `total_files` is the number of files in scope after filtering.
+    Started { total_files: usize },
+    /// A file has been processed (either embedded, skipped, or unchanged).
+    /// `processed_files` is the running count of files processed so far.
+    File {
+        processed_files: usize,
+        total_files: usize,
+        path: String,
+        status: IndexFileStatus,
+    },
+    /// All files have been processed and we are finalizing search indices.
+    Finalizing { total_files: usize },
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum IndexFileStatus {
+    Indexed,
+    Unchanged,
+    Skipped,
+    Failed,
+}
+
+impl IndexFileStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Indexed => "indexed",
+            Self::Unchanged => "unchanged",
+            Self::Skipped => "skipped",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// Type-erased progress callback. Synchronous because indexing already runs on a
+/// dedicated task and the callback only needs to forward events (e.g. via Tauri emit).
+pub type ProgressCallback = Box<dyn Fn(IndexProgress) + Send + Sync>;
+
 pub fn default_document_config(path: &Path) -> AppConfig {
     let storage = document_storage_paths(path);
     AppConfig {
@@ -256,9 +298,24 @@ pub async fn index_folder(path: &Path, config: AppConfig) -> Result<FolderRecord
 
 pub async fn index_folder_with_file_types(
     path: &Path,
-    mut config: AppConfig,
+    config: AppConfig,
     file_types: Option<Vec<String>>,
 ) -> Result<FolderRecord> {
+    index_folder_with_progress(path, config, file_types, None).await
+}
+
+pub async fn index_folder_with_progress(
+    path: &Path,
+    mut config: AppConfig,
+    file_types: Option<Vec<String>>,
+    progress: Option<ProgressCallback>,
+) -> Result<FolderRecord> {
+    let emit = |event: IndexProgress| {
+        if let Some(callback) = progress.as_ref() {
+            callback(event);
+        }
+    };
+
     let canonical = std::fs::canonicalize(path)?;
     config.repo.path = canonical.to_string_lossy().to_string();
     normalize_document_storage(&mut config);
@@ -278,6 +335,9 @@ pub async fn index_folder_with_file_types(
         &config.repo.exclude,
         &record.file_types,
     )?;
+    let total_files = current_files.len();
+    emit(IndexProgress::Started { total_files });
+
     let current_paths: HashSet<String> = current_files
         .iter()
         .map(|path| path.to_string_lossy().to_string())
@@ -293,6 +353,7 @@ pub async fn index_folder_with_file_types(
 
     let mut new_manifest = HashMap::new();
     let mut failed_files = 0usize;
+    let mut processed_files = 0usize;
     for file in current_files {
         let bytes = std::fs::read(&file)?;
         let hash = hash_bytes(&bytes);
@@ -300,6 +361,13 @@ pub async fn index_folder_with_file_types(
 
         if old_manifest.get(&file_str) == Some(&hash) {
             new_manifest.insert(file_str.clone(), hash);
+            processed_files += 1;
+            emit(IndexProgress::File {
+                processed_files,
+                total_files,
+                path: file_str,
+                status: IndexFileStatus::Unchanged,
+            });
             continue;
         }
 
@@ -309,13 +377,27 @@ pub async fn index_folder_with_file_types(
                 warn!(path = %file.display(), error = %err, "skipping unreadable document during indexing");
                 sqlite::delete_file(&conn, &record.id, &file_str)?;
                 failed_files += 1;
+                processed_files += 1;
+                emit(IndexProgress::File {
+                    processed_files,
+                    total_files,
+                    path: file_str,
+                    status: IndexFileStatus::Failed,
+                });
                 continue;
             }
         };
         let chunks = chunk_document(&extracted);
         if chunks.is_empty() {
             sqlite::delete_file(&conn, &record.id, &file_str)?;
-            new_manifest.insert(file_str, hash);
+            new_manifest.insert(file_str.clone(), hash);
+            processed_files += 1;
+            emit(IndexProgress::File {
+                processed_files,
+                total_files,
+                path: file_str,
+                status: IndexFileStatus::Skipped,
+            });
             continue;
         }
 
@@ -329,6 +411,13 @@ pub async fn index_folder_with_file_types(
                 warn!(path = %file.display(), error = %err, "skipping document after embedding failure");
                 sqlite::delete_file(&conn, &record.id, &file_str)?;
                 failed_files += 1;
+                processed_files += 1;
+                emit(IndexProgress::File {
+                    processed_files,
+                    total_files,
+                    path: file_str,
+                    status: IndexFileStatus::Failed,
+                });
                 continue;
             }
         };
@@ -341,8 +430,17 @@ pub async fn index_folder_with_file_types(
             &chunks,
             &embeddings,
         )?;
-        new_manifest.insert(file_str, hash);
+        new_manifest.insert(file_str.clone(), hash);
+        processed_files += 1;
+        emit(IndexProgress::File {
+            processed_files,
+            total_files,
+            path: file_str,
+            status: IndexFileStatus::Indexed,
+        });
     }
+
+    emit(IndexProgress::Finalizing { total_files });
 
     let rows = sqlite::list_chunks_for_folder(&conn, &record.id)?;
     exact::rebuild_index(&storage.tantivy_dir, &rows)?;

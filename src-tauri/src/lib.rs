@@ -1,16 +1,20 @@
 use compas_docs_core::backend::{
-    add_folder_with_file_types, default_document_config, index_folder_with_file_types,
-    library_stats, list_folders, open_document, remove_folder, reveal_in_finder, search_documents,
-    FolderRecord, LibraryStats, SearchDocumentItem,
+    add_folder_with_file_types, default_document_config, index_folder_with_progress, library_stats,
+    list_folders, open_document, remove_folder, reveal_in_finder, search_documents, FolderRecord,
+    IndexProgress, LibraryStats, SearchDocumentItem,
 };
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::Arc;
 use tauri::menu::{MenuBuilder, SubmenuBuilder};
 use tauri::{Emitter, Manager};
+use tauri_plugin_dialog::DialogExt;
 
 const MENU_OPEN_LIBRARY: &str = "open-library";
 const MENU_OPEN_STATS: &str = "open-stats";
+const MENU_OPEN_SEARCH: &str = "open-search";
 const NAVIGATE_EVENT: &str = "app:navigate";
+const INDEX_PROGRESS_EVENT: &str = "index:progress";
 const WINDOW_MAIN: &str = "main";
 
 #[derive(Debug, Serialize)]
@@ -75,6 +79,70 @@ struct RemoveFolderResponse {
     removed: bool,
 }
 
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct IndexProgressDto {
+    folder_id: String,
+    /// One of: "started" | "file" | "finalizing" | "completed" | "failed".
+    /// Kept as a string so the frontend can switch on it cleanly.
+    phase: String,
+    processed_files: usize,
+    total_files: usize,
+    current_path: Option<String>,
+    file_status: Option<String>,
+}
+
+impl IndexProgressDto {
+    fn from_event(folder_id: &str, event: IndexProgress) -> Self {
+        match event {
+            IndexProgress::Started { total_files } => Self {
+                folder_id: folder_id.to_string(),
+                phase: "started".into(),
+                processed_files: 0,
+                total_files,
+                current_path: None,
+                file_status: None,
+            },
+            IndexProgress::File {
+                processed_files,
+                total_files,
+                path,
+                status,
+            } => Self {
+                folder_id: folder_id.to_string(),
+                phase: "file".into(),
+                processed_files,
+                total_files,
+                current_path: Some(path),
+                file_status: Some(status.as_str().to_string()),
+            },
+            IndexProgress::Finalizing { total_files } => Self {
+                folder_id: folder_id.to_string(),
+                phase: "finalizing".into(),
+                processed_files: total_files,
+                total_files,
+                current_path: None,
+                file_status: None,
+            },
+        }
+    }
+
+    fn terminal(folder_id: &str, ok: bool) -> Self {
+        Self {
+            folder_id: folder_id.to_string(),
+            phase: if ok {
+                "completed".into()
+            } else {
+                "failed".into()
+            },
+            processed_files: 0,
+            total_files: 0,
+            current_path: None,
+            file_status: None,
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct LibraryStatsDto {
@@ -135,15 +203,63 @@ fn add_document_folder(
 
 #[tauri::command]
 async fn index_document_folder(
+    app: tauri::AppHandle,
+    folder_id: String,
     path: String,
     file_types: Option<Vec<String>>,
 ) -> Result<FolderRecordDto, String> {
     let path = PathBuf::from(path);
     let config = default_document_config(&path);
-    index_folder_with_file_types(&path, config, file_types)
+
+    // Stream progress to the frontend so the Library can render a real progress
+    // bar instead of a generic spinner. Events are scoped to a folder_id so the
+    // UI can match them to the right card if multiple jobs ever run concurrently.
+    let app_for_progress = app.clone();
+    let folder_id_for_progress = folder_id.clone();
+    let progress_callback: compas_docs_core::backend::ProgressCallback =
+        Box::new(move |event: IndexProgress| {
+            let payload = IndexProgressDto::from_event(&folder_id_for_progress, event);
+            if let Err(err) = app_for_progress.emit(INDEX_PROGRESS_EVENT, payload) {
+                log::warn!("failed to emit index progress: {err}");
+            }
+        });
+
+    let result = index_folder_with_progress(&path, config, file_types, Some(progress_callback))
         .await
         .map(FolderRecordDto::from)
-        .map_err(|err| err.to_string())
+        .map_err(|err| err.to_string());
+
+    // Always send a terminal event so the UI can clear in-progress state even
+    // when the job fails before any per-file progress is emitted.
+    let terminal = IndexProgressDto::terminal(&folder_id, result.is_ok());
+    if let Err(err) = app.emit(INDEX_PROGRESS_EVENT, terminal) {
+        log::warn!("failed to emit terminal index progress: {err}");
+    }
+
+    result
+}
+
+#[tauri::command]
+async fn pick_document_folder(app: tauri::AppHandle) -> Result<Option<String>, String> {
+    // Native folder picker dialog; resolves with the chosen absolute path or None
+    // if the user cancels. Routed through a oneshot so the synchronous callback
+    // API plays nicely with async commands.
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let tx = Arc::new(std::sync::Mutex::new(Some(tx)));
+
+    app.dialog().file().pick_folder(move |selection| {
+        if let Some(sender) = tx.lock().ok().and_then(|mut guard| guard.take()) {
+            let _ = sender.send(selection);
+        }
+    });
+
+    let selection = rx.await.map_err(|err| err.to_string())?;
+    Ok(selection.and_then(|file_path| {
+        file_path
+            .into_path()
+            .ok()
+            .map(|p| p.to_string_lossy().to_string())
+    }))
 }
 
 #[tauri::command]
@@ -207,6 +323,7 @@ fn build_app_menu<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
 ) -> tauri::Result<tauri::menu::Menu<R>> {
     let app_menu = SubmenuBuilder::new(app, "Compas Docs")
+        .text(MENU_OPEN_SEARCH, "Open Search")
         .text(MENU_OPEN_LIBRARY, "Open Library")
         .text(MENU_OPEN_STATS, "Open Stats")
         .separator()
@@ -229,6 +346,7 @@ fn build_app_menu<R: tauri::Runtime>(
         .minimize()
         .maximize()
         .separator()
+        .text(MENU_OPEN_SEARCH, "Search")
         .text(MENU_OPEN_LIBRARY, "Library")
         .text(MENU_OPEN_STATS, "Stats")
         .separator()
@@ -245,6 +363,7 @@ fn build_app_menu<R: tauri::Runtime>(
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             if cfg!(debug_assertions) {
                 app.handle().plugin(
@@ -258,6 +377,11 @@ pub fn run() {
             Ok(())
         })
         .on_menu_event(|app, event| match event.id().0.as_str() {
+            MENU_OPEN_SEARCH => {
+                if let Err(err) = navigate_main_window_to_view(app, AppView::Main) {
+                    log::error!("failed to open search view: {err}");
+                }
+            }
             MENU_OPEN_LIBRARY => {
                 if let Err(err) = navigate_main_window_to_view(app, AppView::Library) {
                     log::error!("failed to open library view: {err}");
@@ -280,6 +404,7 @@ pub fn run() {
             open_document_path,
             reveal_document_path,
             navigate_main_window,
+            pick_document_folder,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

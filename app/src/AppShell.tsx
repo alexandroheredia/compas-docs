@@ -8,10 +8,12 @@ type AppShellProps = {
   children: ReactNode
 }
 
-const NAV_ITEMS: Array<{ view: AppView; label: string }> = [
-  { view: 'main', label: 'Search' },
-  { view: 'library', label: 'Library' },
-  { view: 'stats', label: 'Stats' },
+// Each nav item carries its own icon glyph so the rail stays compact at narrow widths
+// (label collapses to icon below 600px, see styles.css).
+const NAV_ITEMS: Array<{ view: AppView; label: string; icon: ReactNode }> = [
+  { view: 'main', label: 'Search', icon: <SearchIcon /> },
+  { view: 'library', label: 'Library', icon: <LibraryIcon /> },
+  { view: 'stats', label: 'Stats', icon: <StatsIcon /> },
 ]
 
 export function AppShell({ currentView, children }: AppShellProps) {
@@ -20,8 +22,10 @@ export function AppShell({ currentView, children }: AppShellProps) {
       <header className="app-header">
         <div className="app-header-inner">
           <div className="app-brand" aria-label="Compas Docs">
+            {/* Compact gradient mark keeps the brand legible without dominating the header. */}
+            <span className="app-brand-mark" aria-hidden="true">C</span>
             <span>Compas</span>
-            <span>Docs</span>
+            <span className="app-brand-sub">Docs</span>
           </div>
 
           <nav className="app-nav" aria-label="Primary">
@@ -33,9 +37,7 @@ export function AppShell({ currentView, children }: AppShellProps) {
                 aria-current={item.view === currentView ? 'page' : undefined}
                 onClick={() => void openView(item.view, currentView)}
               >
-                <span className="nav-icon" aria-hidden="true">
-                  {item.view === 'main' ? <SearchIcon /> : item.view === 'library' ? <LibraryIcon /> : <StatsIcon />}
-                </span>
+                <span className="nav-icon" aria-hidden="true">{item.icon}</span>
                 <span>{item.label}</span>
               </button>
             ))}
@@ -50,29 +52,27 @@ export function AppShell({ currentView, children }: AppShellProps) {
 
 function SearchIcon() {
   return (
-    <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.8">
-      <circle cx="8.5" cy="8.5" r="5.5" />
-      <path d="M12.5 12.5 17 17" strokeLinecap="round" />
+    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round">
+      <circle cx="7" cy="7" r="4.5" />
+      <path d="m10.5 10.5 3 3" />
     </svg>
   )
 }
 
 function LibraryIcon() {
   return (
-    <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.8">
-      <path d="M3 5.25A2.25 2.25 0 0 1 5.25 3h2.3a2 2 0 0 1 1.4.57l.97.93H14.75A2.25 2.25 0 0 1 17 6.75v7A2.25 2.25 0 0 1 14.75 16H5.25A2.25 2.25 0 0 1 3 13.75v-8.5Z" strokeLinejoin="round" />
-      <path d="M3 7h14" strokeLinecap="round" />
+    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinejoin="round">
+      <path d="M2 4.5A1.5 1.5 0 0 1 3.5 3h2.4a1.4 1.4 0 0 1 .98.4l.84.8H12.5A1.5 1.5 0 0 1 14 5.7v6.3A1.5 1.5 0 0 1 12.5 13.5h-9A1.5 1.5 0 0 1 2 12V4.5Z" />
     </svg>
   )
 }
 
 function StatsIcon() {
   return (
-    <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.8">
-      <path d="M4 16V9" strokeLinecap="round" />
-      <path d="M10 16V5" strokeLinecap="round" />
-      <path d="M16 16v-3" strokeLinecap="round" />
-      <path d="M3 16.25h14" strokeLinecap="round" />
+    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round">
+      <path d="M3 13V7.5" />
+      <path d="M8 13V3.5" />
+      <path d="M13 13v-4" />
     </svg>
   )
 }
