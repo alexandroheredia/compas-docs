@@ -36,3 +36,4 @@
 # TypeScript incremental build metadata
 *.tsbuildinfo
 /.evals
+.DS_Store
