@@ -13,6 +13,9 @@ import {
   statusTone,
 } from './utils'
 
+const SUPPORTED_FILE_TYPES = ['md', 'txt', 'pdf'] as const
+const DEFAULT_FILE_TYPES = [...SUPPORTED_FILE_TYPES]
+
 type BusyAction =
   | { type: 'add' }
   | { type: 'index'; folderId: string }
@@ -22,6 +25,7 @@ type BusyAction =
 export default function LibraryWindow() {
   const [folders, setFolders] = useState<FolderRecord[]>([])
   const [folderPath, setFolderPath] = useState('')
+  const [selectedFileTypes, setSelectedFileTypes] = useState<string[]>(DEFAULT_FILE_TYPES)
   const [status, setStatus] = useState('Loading folders...')
   const [busyAction, setBusyAction] = useState<BusyAction>(null)
   const folderPathRef = useRef<HTMLInputElement>(null)
@@ -57,6 +61,42 @@ export default function LibraryWindow() {
   function focusPathInput() {
     folderPathRef.current?.focus()
     folderPathRef.current?.select()
+  }
+
+  function formatFileTypes(fileTypes: string[]) {
+    if (fileTypes.length === 0) {
+      return 'No file types selected'
+    }
+
+    return fileTypes.map((fileType) => fileType.toUpperCase()).join(', ')
+  }
+
+  function toggleFileTypeSelection(current: string[], fileType: string) {
+    if (current.includes(fileType)) {
+      if (current.length === 1) {
+        return current
+      }
+
+      return current.filter((value) => value !== fileType)
+    }
+
+    return SUPPORTED_FILE_TYPES.filter(
+      (supportedType) => supportedType === fileType || current.includes(supportedType),
+    )
+  }
+
+  function toggleSelectedFileType(fileType: string) {
+    setSelectedFileTypes((current) => toggleFileTypeSelection(current, fileType))
+  }
+
+  function toggleFolderFileType(folderId: string, fileType: string) {
+    setFolders((current) =>
+      current.map((folder) =>
+        folder.id === folderId
+          ? { ...folder, fileTypes: toggleFileTypeSelection(folder.fileTypes, fileType) }
+          : folder,
+      ),
+    )
   }
 
   async function loadFolders() {
@@ -143,14 +183,23 @@ export default function LibraryWindow() {
       return
     }
 
+    if (selectedFileTypes.length === 0) {
+      setStatus('Select at least one file type before adding a folder.')
+      return
+    }
+
     setBusyAction({ type: 'add' })
     setStatus(`Adding ${trimmedPath}...`)
 
     try {
-      const record = await invoke<FolderRecord>('add_document_folder', { path: trimmedPath })
+      const record = await invoke<FolderRecord>('add_document_folder', {
+        path: trimmedPath,
+        fileTypes: selectedFileTypes,
+      })
       setFolderPath('')
+      setSelectedFileTypes(DEFAULT_FILE_TYPES)
       await loadFolders()
-      setStatus(`Added ${record.displayName}. Run its first index when you are ready.`)
+      setStatus(`Added ${record.displayName} for ${formatFileTypes(record.fileTypes)}. Run its first index when you are ready.`)
     } catch (error) {
       setStatus(formatError(error))
     } finally {
@@ -163,11 +212,19 @@ export default function LibraryWindow() {
       return
     }
 
+    if (folder.fileTypes.length === 0) {
+      setStatus(`Select at least one file type for ${folder.displayName} before indexing.`)
+      return
+    }
+
     setBusyAction({ type: 'index', folderId: folder.id })
-    setStatus(`Indexing ${folder.displayName}...`)
+    setStatus(`Indexing ${folder.displayName} for ${formatFileTypes(folder.fileTypes)}...`)
 
     try {
-      await invoke<FolderRecord>('index_document_folder', { path: folder.path })
+      await invoke<FolderRecord>('index_document_folder', {
+        path: folder.path,
+        fileTypes: folder.fileTypes,
+      })
       const nextFolders = await loadFolders()
       setStatus(
         nextFolders.some((record) => record.id === folder.id && record.lastIndexedAt !== null)
@@ -264,6 +321,29 @@ export default function LibraryWindow() {
                 Example: <code>/Users/alexandro/Documents/Contracts</code>
               </p>
 
+              <fieldset className="stack-field file-type-fieldset" disabled={!hasTauriInvoke || busy}>
+                <legend>File types</legend>
+                <div className="file-type-grid">
+                  {SUPPORTED_FILE_TYPES.map((fileType) => {
+                    const checked = selectedFileTypes.includes(fileType)
+
+                    return (
+                      <label className={`file-type-option${checked ? ' is-selected' : ''}`} key={fileType}>
+                        <input
+                          type="checkbox"
+                          checked={checked}
+                          onChange={() => toggleSelectedFileType(fileType)}
+                          disabled={checked && selectedFileTypes.length === 1}
+                        />
+                        <span>{fileType.toUpperCase()}</span>
+                      </label>
+                    )
+                  })}
+                </div>
+              </fieldset>
+
+              <p className="helper-text">Select which supported document types this folder should index.</p>
+
               <button type="submit" className="primary-button" disabled={!hasTauriInvoke || busy}>
                 {busyAction?.type === 'add' ? 'Adding...' : 'Add folder'}
               </button>
@@ -330,6 +410,28 @@ export default function LibraryWindow() {
                       <div className="result-tags">
                         <span>{formatIndexedAt(folder.lastIndexedAt)}</span>
                         <span>{folder.watchEnabled ? 'Watching enabled' : 'Manual indexing'}</span>
+                        <span>{formatFileTypes(folder.fileTypes)}</span>
+                      </div>
+
+                      <div className="folder-card-controls">
+                        <p className="helper-text">Choose which supported file types to include on the next index run.</p>
+                        <div className="file-type-grid">
+                          {SUPPORTED_FILE_TYPES.map((fileType) => {
+                            const checked = folder.fileTypes.includes(fileType)
+
+                            return (
+                              <label className={`file-type-option${checked ? ' is-selected' : ''}`} key={fileType}>
+                                <input
+                                  type="checkbox"
+                                  checked={checked}
+                                  onChange={() => toggleFolderFileType(folder.id, fileType)}
+                                  disabled={busy || (checked && folder.fileTypes.length === 1)}
+                                />
+                                <span>{fileType.toUpperCase()}</span>
+                              </label>
+                            )
+                          })}
+                        </div>
                       </div>
 
                       <div className="result-actions folder-card-actions">

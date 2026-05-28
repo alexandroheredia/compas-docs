@@ -5,7 +5,10 @@ use crate::config::{
 use crate::embedder::{build_embedder, EmbedMode};
 use crate::exact;
 use crate::extractors::{lowercase_extension, DocumentExtractorRegistry};
-use crate::models::{DocumentStoragePaths, FolderRegistry};
+use crate::models::{
+    default_folder_file_types, normalize_or_default_folder_file_types, DocumentStoragePaths,
+    FolderRegistry,
+};
 use crate::ranking::merge_hybrid;
 use crate::sqlite::{self, ChunkRow};
 use crate::vector;
@@ -120,6 +123,13 @@ pub fn folder_registry_path() -> PathBuf {
 }
 
 pub fn add_folder(path: &Path) -> Result<FolderRecord> {
+    add_folder_with_file_types(path, None)
+}
+
+pub fn add_folder_with_file_types(
+    path: &Path,
+    file_types: Option<Vec<String>>,
+) -> Result<FolderRecord> {
     let canonical = std::fs::canonicalize(path)?;
     if !canonical.is_dir() {
         return Err(anyhow!("'{}' is not a directory", canonical.display()));
@@ -127,6 +137,15 @@ pub fn add_folder(path: &Path) -> Result<FolderRecord> {
     let mut registry = load_folder_registry();
     let id = stable_folder_id(&canonical);
     let storage = document_storage_paths(&canonical);
+    let normalized_file_types = match file_types {
+        Some(selected) => normalize_or_default_folder_file_types(&selected),
+        None => registry
+            .folders
+            .iter()
+            .find(|folder| folder.id == id)
+            .map(|folder| normalize_or_default_folder_file_types(&folder.file_types))
+            .unwrap_or_else(default_folder_file_types),
+    };
 
     let record = FolderRecord {
         id: id.clone(),
@@ -137,6 +156,7 @@ pub fn add_folder(path: &Path) -> Result<FolderRecord> {
             .unwrap_or("folder")
             .to_string(),
         storage_path: storage.store_path.to_string_lossy().to_string(),
+        file_types: normalized_file_types,
         last_indexed_at: registry
             .folders
             .iter()
@@ -160,6 +180,9 @@ pub fn add_folder(path: &Path) -> Result<FolderRecord> {
 
 pub fn list_folders() -> Vec<FolderRecord> {
     let mut registry = load_folder_registry();
+    for folder in &mut registry.folders {
+        folder.file_types = normalize_or_default_folder_file_types(&folder.file_types);
+    }
     registry
         .folders
         .sort_by(|a, b| a.display_name.cmp(&b.display_name));
@@ -227,7 +250,15 @@ pub fn library_stats() -> Result<LibraryStats> {
     })
 }
 
-pub async fn index_folder(path: &Path, mut config: AppConfig) -> Result<FolderRecord> {
+pub async fn index_folder(path: &Path, config: AppConfig) -> Result<FolderRecord> {
+    index_folder_with_file_types(path, config, None).await
+}
+
+pub async fn index_folder_with_file_types(
+    path: &Path,
+    mut config: AppConfig,
+    file_types: Option<Vec<String>>,
+) -> Result<FolderRecord> {
     let canonical = std::fs::canonicalize(path)?;
     config.repo.path = canonical.to_string_lossy().to_string();
     normalize_document_storage(&mut config);
@@ -235,14 +266,18 @@ pub async fn index_folder(path: &Path, mut config: AppConfig) -> Result<FolderRe
     std::fs::create_dir_all(&storage.root)?;
     std::fs::create_dir_all(&storage.store_path)?;
 
-    let record = add_folder(&canonical)?;
+    let record = add_folder_with_file_types(&canonical, file_types)?;
     let mut conn = sqlite::open_database(&storage.sqlite_path)?;
     let embedder = build_embedder(&config.embedder)?;
     let extractors = DocumentExtractorRegistry::new();
 
     let old_manifest = load_manifest(&storage.manifest_path);
-    let current_files =
-        collect_document_files(&canonical, &config.repo.include, &config.repo.exclude)?;
+    let current_files = collect_document_files(
+        &canonical,
+        &config.repo.include,
+        &config.repo.exclude,
+        &record.file_types,
+    )?;
     let current_paths: HashSet<String> = current_files
         .iter()
         .map(|path| path.to_string_lossy().to_string())
@@ -452,7 +487,9 @@ fn collect_document_files(
     repo_path: &Path,
     include: &[String],
     exclude: &[String],
+    file_types: &[String],
 ) -> Result<Vec<PathBuf>> {
+    let normalized_file_types = normalize_or_default_folder_file_types(file_types);
     let mut files = Vec::new();
     for entry in walkdir::WalkDir::new(repo_path) {
         let entry = match entry {
@@ -467,10 +504,13 @@ fn collect_document_files(
         if !should_include(relative, include, exclude) {
             continue;
         }
-        if !matches!(
-            lowercase_extension(&path).as_deref(),
-            Some("md" | "txt" | "pdf")
-        ) {
+        let Some(extension) = lowercase_extension(&path) else {
+            continue;
+        };
+        if !normalized_file_types
+            .iter()
+            .any(|file_type| file_type == &extension)
+        {
             continue;
         }
         files.push(path);
@@ -700,5 +740,69 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("reindex"));
         assert!(error.to_string().contains(&record.id));
+    }
+
+    #[test]
+    fn add_folder_defaults_and_normalizes_file_types() {
+        let _guard = lock_tests();
+        let library_dir = unique_temp_path("file-types-defaults");
+        let folder_dir = unique_temp_path("file-types-folder");
+        std::fs::create_dir_all(&folder_dir).unwrap();
+        let _env_guard = EnvVarGuard::set("COMPAS_DOCS_HOME", &library_dir);
+
+        let record = add_folder(&folder_dir).unwrap();
+        assert_eq!(record.file_types, default_folder_file_types());
+
+        let updated = add_folder_with_file_types(
+            &folder_dir,
+            Some(vec!["PDF".into(), "txt".into(), "zip".into(), "txt".into()]),
+        )
+        .unwrap();
+        assert_eq!(
+            updated.file_types,
+            vec!["txt".to_string(), "pdf".to_string()]
+        );
+
+        let listed = list_folders();
+        assert_eq!(
+            listed[0].file_types,
+            vec!["txt".to_string(), "pdf".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn index_folder_filters_by_selected_file_types() {
+        let _guard = lock_tests();
+        let library_dir = unique_temp_path("index-file-types-library");
+        let folder_dir = unique_temp_path("index-file-types-folder");
+        std::fs::create_dir_all(folder_dir.join("docs")).unwrap();
+        std::fs::write(
+            folder_dir.join("docs").join("policy.md"),
+            "# Insurance Policy\n\nRenewal date is January 15.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            folder_dir.join("docs").join("notes.txt"),
+            "Renewal notes for the policy holder.\n",
+        )
+        .unwrap();
+        let _env_guard = EnvVarGuard::set("COMPAS_DOCS_HOME", &library_dir);
+
+        let mut config = default_document_config(&folder_dir);
+        config.embedder.provider = "test".into();
+        config.embedder.model = "test".into();
+
+        let record =
+            index_folder_with_file_types(&folder_dir, config.clone(), Some(vec!["txt".into()]))
+                .await
+                .unwrap();
+        assert_eq!(record.file_types, vec!["txt".to_string()]);
+
+        let results = search_documents("renewal notes", Some(&record.id), 5, config)
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].file_path, "docs/notes.txt");
     }
 }

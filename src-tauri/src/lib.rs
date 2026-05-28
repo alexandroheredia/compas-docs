@@ -1,7 +1,7 @@
 use compas_docs_core::backend::{
-    add_folder, default_document_config, index_folder, library_stats, list_folders, open_document,
-    remove_folder, reveal_in_finder, search_documents, FolderRecord, LibraryStats,
-    SearchDocumentItem,
+    add_folder_with_file_types, default_document_config, index_folder_with_file_types,
+    library_stats, list_folders, open_document, remove_folder, reveal_in_finder, search_documents,
+    FolderRecord, LibraryStats, SearchDocumentItem,
 };
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -20,6 +20,7 @@ struct FolderRecordDto {
     path: String,
     display_name: String,
     storage_path: String,
+    file_types: Vec<String>,
     last_indexed_at: Option<u64>,
     watch_enabled: bool,
 }
@@ -31,6 +32,7 @@ impl From<FolderRecord> for FolderRecordDto {
             path: value.path,
             display_name: value.display_name,
             storage_path: value.storage_path,
+            file_types: value.file_types,
             last_indexed_at: value.last_indexed_at,
             watch_enabled: value.watch_enabled,
         }
@@ -122,17 +124,23 @@ fn list_document_folders() -> Result<Vec<FolderRecordDto>, String> {
 }
 
 #[tauri::command]
-fn add_document_folder(path: String) -> Result<FolderRecordDto, String> {
-    add_folder(PathBuf::from(path).as_path())
+fn add_document_folder(
+    path: String,
+    file_types: Option<Vec<String>>,
+) -> Result<FolderRecordDto, String> {
+    add_folder_with_file_types(PathBuf::from(path).as_path(), file_types)
         .map(FolderRecordDto::from)
         .map_err(|err| err.to_string())
 }
 
 #[tauri::command]
-async fn index_document_folder(path: String) -> Result<FolderRecordDto, String> {
+async fn index_document_folder(
+    path: String,
+    file_types: Option<Vec<String>>,
+) -> Result<FolderRecordDto, String> {
     let path = PathBuf::from(path);
     let config = default_document_config(&path);
-    index_folder(&path, config)
+    index_folder_with_file_types(&path, config, file_types)
         .await
         .map(FolderRecordDto::from)
         .map_err(|err| err.to_string())

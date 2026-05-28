@@ -2606,6 +2606,7 @@ index:
 
     #[test]
     fn test_load_command_config_builds_default_document_mode_for_folder_override() {
+        let _guard = lock_tests();
         let repo_dir = unique_temp_path("document-default-config");
         let library_dir = unique_temp_path("document-default-config-library");
         std::fs::create_dir_all(&repo_dir).unwrap();

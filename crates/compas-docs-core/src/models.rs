@@ -10,6 +10,34 @@ pub const PAGE_START_KEY: &str = "page_start";
 pub const PAGE_END_KEY: &str = "page_end";
 pub const TEXT_KEY: &str = "text";
 pub const PREVIEW_KEY: &str = "preview";
+pub const SUPPORTED_DOCUMENT_FILE_TYPES: &[&str] = &["md", "txt", "pdf"];
+
+pub fn default_folder_file_types() -> Vec<String> {
+    SUPPORTED_DOCUMENT_FILE_TYPES
+        .iter()
+        .map(|file_type| (*file_type).to_string())
+        .collect()
+}
+
+pub fn normalize_folder_file_types(file_types: &[String]) -> Vec<String> {
+    SUPPORTED_DOCUMENT_FILE_TYPES
+        .iter()
+        .filter(|supported| {
+            file_types
+                .iter()
+                .any(|file_type| file_type.trim().eq_ignore_ascii_case(supported))
+        })
+        .map(|file_type| (*file_type).to_string())
+        .collect()
+}
+
+pub fn normalize_or_default_folder_file_types(file_types: &[String]) -> Vec<String> {
+    let normalized = normalize_folder_file_types(file_types);
+    if normalized.is_empty() {
+        return default_folder_file_types();
+    }
+    normalized
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DocumentStoragePaths {
@@ -27,6 +55,8 @@ pub struct FolderRecord {
     pub path: String,
     pub display_name: String,
     pub storage_path: String,
+    #[serde(default = "default_folder_file_types")]
+    pub file_types: Vec<String>,
     pub last_indexed_at: Option<u64>,
     pub watch_enabled: bool,
 }

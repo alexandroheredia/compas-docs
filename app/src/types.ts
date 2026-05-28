@@ -5,6 +5,7 @@ export type FolderRecord = {
   path: string
   displayName: string
   storagePath: string
+  fileTypes: string[]
   lastIndexedAt: number | null
   watchEnabled: boolean
 }
