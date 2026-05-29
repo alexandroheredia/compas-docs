@@ -22,7 +22,7 @@ export default function StatsWindow() {
   // Prevent the window-focus refresh from clobbering a freshly surfaced
   // error or a manual-refresh confirmation.
   const lastManualActionRef = useRef(0)
-  const { toasts, push: pushToast, dismiss: dismissToast } = useToasts()
+  const { toasts, exitingIds, push: pushToast, dismiss: dismissToast } = useToasts()
 
   const tone = statusTone(status, busy)
   const hasData = stats !== null && stats.documentCount > 0
@@ -198,7 +198,7 @@ export default function StatsWindow() {
           )}
         </section>
       </div>
-      <ToastStack toasts={toasts} onDismiss={dismissToast} />
+      <ToastStack toasts={toasts} exitingIds={exitingIds} onDismiss={dismissToast} />
     </AppShell>
   )
 }

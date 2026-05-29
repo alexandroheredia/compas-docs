@@ -17,7 +17,7 @@
   --font-sans: -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', 'Helvetica Neue', sans-serif;
   --font-mono: 'JetBrains Mono', 'SF Mono', 'SFMono-Regular', Menlo, Consolas, monospace;
 
-  /* Light palette. Warm-neutral off-whites; deep slate text; quiet blue accent. */
+  /* Light palette. Warm-neutral off-whites; deep slate text. */
   --bg: #f7f6f3;
   --bg-elevated: #fdfcfa;
   --surface: #ffffff;
@@ -34,11 +34,12 @@
   --border-strong: rgba(20, 22, 30, 0.16);
   --border-input: rgba(20, 22, 30, 0.14);
 
-  /* Accent: steel blue. Pulled toward neutral so it never feels "branded". */
-  --accent: #3a6df0;
-  --accent-strong: #2a55c8;
-  --accent-soft: rgba(58, 109, 240, 0.10);
-  --accent-ring: rgba(58, 109, 240, 0.32);
+  /* No hue accent — all interactive chrome uses neutral ink so nothing
+     competes with content. Downstream tokens use these so swapping is trivial. */
+  --accent: #313540;
+  --accent-strong: #1c1f28;
+  --accent-soft: rgba(20, 22, 30, 0.07);
+  --accent-ring: rgba(20, 22, 30, 0.20);
 
   --success: #1f7a4d;
   --success-soft: rgba(31, 122, 77, 0.10);
@@ -50,6 +51,12 @@
   --shadow-sm: 0 1px 2px rgba(20, 22, 30, 0.04);
   --shadow-md: 0 4px 16px -4px rgba(20, 22, 30, 0.10), 0 1px 2px rgba(20, 22, 30, 0.04);
   --shadow-lg: 0 16px 40px -12px rgba(20, 22, 30, 0.18), 0 2px 6px rgba(20, 22, 30, 0.06);
+
+  /* Glass surface tokens: frosted-blur approximation — WKWebView/Safari can do blur+saturate
+     but not SVG feDisplacementMap-based refraction (11-yr WebKit bug), so this is the ceiling.
+     Gradient surface creates an internal gloss sheen visible even over matching backgrounds. */
+  --glass-surface: linear-gradient(175deg, rgba(255, 255, 255, 0.96) 0%, rgba(255, 255, 255, 0.72) 100%);
+  --glass-specular-top: rgba(255, 255, 255, 1.0);
 
   --content-max: 1080px;
   --content-pad: clamp(20px, 3vw, 36px);
@@ -93,10 +100,10 @@
     --border-strong: rgba(255, 255, 255, 0.13);
     --border-input: rgba(255, 255, 255, 0.12);
 
-    --accent: #6b93ff;
-    --accent-strong: #94aeff;
-    --accent-soft: rgba(107, 147, 255, 0.14);
-    --accent-ring: rgba(107, 147, 255, 0.40);
+    --accent: #babdc8;
+    --accent-strong: #d4d7e2;
+    --accent-soft: rgba(255, 255, 255, 0.10);
+    --accent-ring: rgba(255, 255, 255, 0.24);
 
     --success: #4cae84;
     --success-soft: rgba(76, 174, 132, 0.14);
@@ -108,7 +115,17 @@
     --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
     --shadow-md: 0 6px 18px -4px rgba(0, 0, 0, 0.55), 0 1px 2px rgba(0, 0, 0, 0.4);
     --shadow-lg: 0 22px 48px -16px rgba(0, 0, 0, 0.65), 0 2px 6px rgba(0, 0, 0, 0.45);
+
+    --glass-surface: linear-gradient(175deg, rgba(40, 43, 52, 0.92) 0%, rgba(26, 28, 34, 0.78) 100%);
+    --glass-specular-top: rgba(255, 255, 255, 0.18);
   }
+
+  /* Active nav pill in dark mode: frosted-white sheen lifts it above the dark container. */
+  .nav-item.is-active {
+    background: rgba(255, 255, 255, 0.13);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.22), 0 1px 3px rgba(0, 0, 0, 0.35);
+  }
+
 }
 
 * {
@@ -202,6 +219,8 @@ textarea:focus-visible,
   backdrop-filter: saturate(160%) blur(14px);
   -webkit-backdrop-filter: saturate(160%) blur(14px);
   border-bottom: 1px solid var(--border);
+  /* Specular rim: the header bar catches ambient light at its top edge. */
+  box-shadow: inset 0 1px 0 var(--glass-specular-top);
 }
 
 .app-header-inner {
@@ -250,7 +269,10 @@ textarea:focus-visible,
   padding: 3px;
   border: 1px solid var(--border);
   border-radius: 999px;
-  background: var(--surface);
+  /* Glass pill: gradient surface + specular rim; no extra blur since it's nested in the
+     already-blurring app-header compositing context. */
+  background: var(--glass-surface);
+  box-shadow: inset 0 1px 0 var(--glass-specular-top), var(--shadow-sm);
 }
 
 .nav-item {
@@ -272,8 +294,11 @@ textarea:focus-visible,
 .nav-item:hover { color: var(--text-strong); }
 
 .nav-item.is-active {
-  background: var(--surface-2);
+  /* White pill lifts off the glass nav container via shadow — visible even when
+     the container bg is near-white. */
+  background: var(--surface);
   color: var(--text-strong);
+  box-shadow: 0 1px 4px rgba(20, 22, 30, 0.16), 0 1px 2px rgba(20, 22, 30, 0.08);
 }
 
 .nav-icon {
@@ -295,6 +320,8 @@ textarea:focus-visible,
   padding: 24px 0 40px;
   display: grid;
   gap: 20px;
+  /* Fade in on view mount. */
+  animation: viewIn var(--dur-fast) var(--ease) both;
 }
 
 .window-main {
@@ -305,6 +332,8 @@ textarea:focus-visible,
   display: grid;
   grid-template-rows: auto minmax(0, 1fr) auto;
   gap: 0;
+  /* Fade in on view mount so tab switches don't feel like hard cuts. */
+  animation: viewIn var(--dur-fast) var(--ease) both;
 }
 
 .main-header,
@@ -375,10 +404,12 @@ textarea:focus-visible,
 /* ─────────────────────────────────────────────────────── Surfaces ─── */
 
 .surface {
-  background: var(--surface);
+  background: var(--glass-surface);
   border: 1px solid var(--border);
   border-radius: var(--radius-surface);
-  box-shadow: var(--shadow-sm);
+  /* Gradient + specular without backdrop-filter — these panels are large and stationary;
+     the blur would be invisible over flat var(--bg) and expensive to composite. */
+  box-shadow: inset 0 1px 0 var(--glass-specular-top), var(--shadow-sm);
 }
 
 .section {
@@ -549,14 +580,24 @@ textarea:focus-visible,
   padding: 8px 10px 8px 14px;
   border: 1px solid var(--border-strong);
   border-radius: 14px;
-  background: var(--surface);
-  box-shadow: var(--shadow-md);
+  /* Frosted-glass surface: blur + tint is the achievable ceiling on WKWebView/Safari.
+     True refraction (Liquid Glass) requires Chrome-only SVG backdrop-filter. */
+  background: var(--glass-surface);
+  -webkit-backdrop-filter: blur(20px) saturate(180%);
+  backdrop-filter: blur(20px) saturate(180%);
+  box-shadow:
+    inset 0 1px 0 var(--glass-specular-top),
+    var(--shadow-md);
   transition: border-color var(--dur-fast) var(--ease), box-shadow var(--dur-fast) var(--ease);
 }
 
 .composer:focus-within {
-  border-color: var(--accent);
-  box-shadow: 0 0 0 3px var(--accent-ring), var(--shadow-md);
+  /* Glass lift on focus: stronger shadow suggests the surface has floated
+     higher — no hue ring needed. */
+  border-color: var(--border-strong);
+  box-shadow:
+    inset 0 1px 0 var(--glass-specular-top),
+    var(--shadow-lg);
 }
 
 .composer-icon {
@@ -580,6 +621,15 @@ textarea:focus-visible,
 .composer input:focus { outline: none; }
 .composer input::placeholder { color: var(--text-subtle); }
 
+.composer-actions {
+  /* Keeps clear + submit as a single grid column so results loading never
+     wraps the submit button to a second row. */
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
 .composer-submit {
   width: 34px;
   height: 34px;
@@ -594,6 +644,8 @@ textarea:focus-visible,
 }
 
 .composer-submit:hover:not(:disabled) { background: var(--accent-strong); }
+/* Physical press feel — scale down slightly on click. */
+.composer-submit:active:not(:disabled) { transform: scale(0.90); }
 .composer-submit:disabled { opacity: 0.45; cursor: not-allowed; }
 .composer-submit svg { width: 16px; height: 16px; }
 
@@ -629,6 +681,36 @@ textarea:focus-visible,
   gap: 6px;
 }
 
+/* Restore solid surfaces when high-contrast is requested — glass reduces text contrast */
+@media (prefers-contrast: more) {
+  .composer,
+  .app-nav,
+  .surface,
+  .result-card,
+  .folder-card,
+  .metric-card,
+  .file-viewer-dialog,
+  .toast {
+    background: var(--surface);
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+    box-shadow: var(--shadow-sm);
+  }
+  .composer:focus-within {
+    box-shadow: var(--shadow-md);
+  }
+  .result-card:hover,
+  .metric-card:hover {
+    box-shadow: var(--shadow-md);
+    transform: none;
+  }
+  .file-viewer-dialog {
+    box-shadow: var(--shadow-lg);
+  }
+  .toast {
+    box-shadow: var(--shadow-lg);
+  }
+}
 /* ───────────────────────────────────────────────── Result cards ─── */
 
 .results-list {
@@ -639,22 +721,37 @@ textarea:focus-visible,
   width: 100%;
 }
 
+/* Staggered card entrance — animation on the li so delay is applied per-item
+   without needing inline styles in JSX. Delay tapers off after the 5th item
+   so a long result set doesn't feel sluggish. */
+.results-list > li {
+  animation: fadeSlide var(--dur) var(--ease) both;
+}
+.results-list > li:nth-child(2)  { animation-delay: 50ms; }
+.results-list > li:nth-child(3)  { animation-delay: 95ms; }
+.results-list > li:nth-child(4)  { animation-delay: 135ms; }
+.results-list > li:nth-child(5)  { animation-delay: 170ms; }
+.results-list > li:nth-child(6)  { animation-delay: 200ms; }
+.results-list > li:nth-child(7)  { animation-delay: 225ms; }
+.results-list > li:nth-child(n+8) { animation-delay: 240ms; }
+
 .result-card {
   display: grid;
   grid-template-columns: 36px minmax(0, 1fr) auto;
   gap: 14px;
   padding: 16px 18px;
-  background: var(--surface);
+  background: var(--glass-surface);
   border: 1px solid var(--border);
   border-radius: var(--radius-card);
+  box-shadow: inset 0 1px 0 var(--glass-specular-top), var(--shadow-sm);
   transition: border-color var(--dur-fast) var(--ease), box-shadow var(--dur-fast) var(--ease), transform var(--dur-fast) var(--ease);
-  /* Subtle entrance: results stagger in as the list updates. */
-  animation: fadeSlide var(--dur) var(--ease) both;
 }
 
 .result-card:hover {
   border-color: var(--border-strong);
-  box-shadow: var(--shadow-md);
+  /* Lift effect: skip backdrop-filter — behind cards is flat var(--bg), blur shows nothing. */
+  box-shadow: inset 0 1px 0 var(--glass-specular-top), var(--shadow-md);
+  transform: translateY(-1px);
 }
 
 .result-card-leading {
@@ -727,7 +824,8 @@ textarea:focus-visible,
 }
 
 .result-preview mark {
-  background: color-mix(in srgb, var(--accent-soft) 100%, transparent);
+  /* Neutral surface wash — highlight without a hue cue. */
+  background: var(--surface-3);
   color: var(--text-strong);
   padding: 1px 3px;
   border-radius: 3px;
@@ -826,13 +924,20 @@ textarea:focus-visible,
   gap: 10px;
 }
 
+/* Stagger folder cards just like result cards. */
+.folder-list > .folder-card:nth-child(2) { animation-delay: 55ms; }
+.folder-list > .folder-card:nth-child(3) { animation-delay: 100ms; }
+.folder-list > .folder-card:nth-child(4) { animation-delay: 140ms; }
+.folder-list > .folder-card:nth-child(n+5) { animation-delay: 165ms; }
+
 .folder-card {
   display: grid;
   gap: 12px;
   padding: 16px 18px;
-  background: var(--surface);
+  background: var(--glass-surface);
   border: 1px solid var(--border);
   border-radius: var(--radius-card);
+  box-shadow: inset 0 1px 0 var(--glass-specular-top), var(--shadow-sm);
   transition: border-color var(--dur-fast) var(--ease), box-shadow var(--dur-fast) var(--ease);
   animation: fadeSlide var(--dur) var(--ease) both;
 }
@@ -943,9 +1048,11 @@ textarea:focus-visible,
 .file-type-option input { position: absolute; opacity: 0; pointer-events: none; }
 
 .file-type-option.is-selected {
-  background: var(--accent-soft);
-  border-color: transparent;
-  color: var(--accent-strong);
+  /* Solid surface + strong border + dark text gives clear selected state
+     without reaching for a hue. */
+  background: var(--surface-2);
+  border-color: var(--border-strong);
+  color: var(--text-strong);
 }
 
 .file-type-option:hover:not(.is-disabled) {
@@ -1021,16 +1128,26 @@ textarea:focus-visible,
 
 .metric-card {
   padding: 18px 18px 16px;
-  background: var(--surface);
+  background: var(--glass-surface);
   border: 1px solid var(--border);
   border-radius: var(--radius-card);
   display: grid;
   gap: 6px;
   min-height: 110px;
-  transition: border-color var(--dur-fast) var(--ease);
+  box-shadow: inset 0 1px 0 var(--glass-specular-top), var(--shadow-sm);
+  transition: border-color var(--dur-fast) var(--ease), box-shadow var(--dur-fast) var(--ease), transform var(--dur-fast) var(--ease);
+  animation: fadeSlide var(--dur) var(--ease) both;
 }
 
-.metric-card:hover { border-color: var(--border-strong); }
+.stats-grid > .metric-card:nth-child(2) { animation-delay: 55ms; }
+.stats-grid > .metric-card:nth-child(3) { animation-delay: 100ms; }
+.stats-grid > .metric-card:nth-child(4) { animation-delay: 140ms; }
+
+.metric-card:hover {
+  border-color: var(--border-strong);
+  box-shadow: inset 0 1px 0 var(--glass-specular-top), var(--shadow-md);
+  transform: translateY(-1px);
+}
 
 .metric-label {
   font-size: 11px;
@@ -1069,14 +1186,25 @@ textarea:focus-visible,
   align-items: start;
   gap: 10px;
   padding: 12px 14px;
-  background: var(--surface);
+  background: var(--glass-surface);
   border: 1px solid var(--border-strong);
   border-radius: 12px;
-  box-shadow: var(--shadow-lg);
+  box-shadow: inset 0 1px 0 var(--glass-specular-top), var(--shadow-lg);
+  /* Blur is meaningful here — toasts float over page content. */
+  -webkit-backdrop-filter: blur(20px) saturate(160%);
+  backdrop-filter: blur(20px) saturate(160%);
   font-size: 13px;
   color: var(--text);
   pointer-events: auto;
   animation: toastIn var(--dur) var(--ease) both;
+}
+
+/* Exit: played by adding .is-exiting before removing the element from the DOM.
+   The 220ms timeout in useToasts matches this duration so React removes the node
+   only after the animation completes, preventing a hard cut. */
+.toast.is-exiting {
+  animation: toastOut 220ms var(--ease) both;
+  pointer-events: none;
 }
 
 .toast-icon {
@@ -1109,9 +1237,27 @@ textarea:focus-visible,
   to { opacity: 1; }
 }
 
+/* Page-level fade — opacity only, since child cards do the translateY themselves. */
+@keyframes viewIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
 @keyframes fadeSlide {
   from { opacity: 0; transform: translateY(4px); }
   to { opacity: 1; transform: none; }
+}
+
+/* Modal entrance: scale from slightly-small so it feels like it materialises. */
+@keyframes dialogIn {
+  from { opacity: 0; transform: translateY(10px) scale(0.97); }
+  to { opacity: 1; transform: none; }
+}
+
+/* Toast exit: fade + slight drop so removal doesn't look like a cut. */
+@keyframes toastOut {
+  from { opacity: 1; transform: none; }
+  to { opacity: 0; transform: translateY(6px) scale(0.97); }
 }
 
 @keyframes pulse {
@@ -1170,4 +1316,172 @@ textarea:focus-visible,
   .app-header-inner { gap: 10px; }
   .nav-item span:not(.nav-icon) { display: none; }
   .nav-item { width: 32px; padding: 0; justify-content: center; }
+}
+
+/* ─────────────────────────────────────────────────── File Viewer ─── */
+
+/* Full-screen backdrop; clicking outside the dialog dismisses it. */
+.file-viewer-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 200;
+  background: rgba(0, 0, 0, 0.48);
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 48px 24px 24px;
+  /* Entrance animation matches the card fade-slide. */
+  animation: fadeIn var(--dur-fast) var(--ease) both;
+}
+
+/* The dialog box itself. */
+.file-viewer-dialog {
+  width: 100%;
+  max-width: 760px;
+  max-height: calc(100vh - 96px);
+  /* Full glass treatment: floats over page content through a dark backdrop, so blur
+     reveals actual content behind it — the most impactful use of backdrop-filter here. */
+  background: var(--glass-surface);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-surface);
+  box-shadow:
+    inset 0 1px 0 var(--glass-specular-top),
+    0 24px 64px rgba(0, 0, 0, 0.30),
+    0 4px 12px rgba(0, 0, 0, 0.12);
+  -webkit-backdrop-filter: blur(28px) saturate(180%);
+  backdrop-filter: blur(28px) saturate(180%);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  /* Scale + translate entrance feels more "modal" than a plain slide. */
+  animation: dialogIn var(--dur) var(--ease) both;
+}
+
+/* Sticky header with file title + close button. */
+.file-viewer-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--border);
+  background: transparent;
+  /* Inherits the dialog's glass surface — no separate background needed. */
+  flex-shrink: 0;
+}
+
+.file-viewer-title-wrap {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  flex: 1;
+}
+
+.file-viewer-icon {
+  display: flex;
+  flex-shrink: 0;
+  width: 28px;
+  height: 34px;
+}
+
+.file-viewer-icon svg { width: 28px; height: 34px; }
+
+.file-viewer-title-block {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+
+.file-viewer-title {
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: var(--text-strong);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.file-viewer-subtitle {
+  font-size: 0.72rem;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.file-viewer-close {
+  flex-shrink: 0;
+}
+
+/* Scrollable content region. */
+.file-viewer-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  /* Ensure smooth momentum scrolling on macOS. */
+  -webkit-overflow-scrolling: touch;
+}
+
+.file-viewer-loading,
+.file-viewer-empty {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-muted);
+  font-size: 0.85rem;
+  padding: 24px 8px;
+}
+
+/* Individual chunk block. */
+.file-chunk {
+  padding: 12px 14px;
+  border-radius: var(--radius-chip);
+  border: 1px solid transparent;
+  transition: background var(--dur-fast) var(--ease), border-color var(--dur-fast) var(--ease);
+}
+
+/* Subtle hover tint on non-active chunks so the list feels interactive. */
+.file-chunk:not(.is-active):hover {
+  background: var(--surface);
+}
+
+/* The chunk that matched the search result gets a clear visual accent and
+   serves as the scroll target when the dialog opens. */
+.file-chunk.is-active {
+  background: var(--surface-2);
+  border-color: var(--border-strong);
+}
+
+.file-chunk-meta {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 6px;
+  flex-wrap: wrap;
+}
+
+.file-chunk-heading {
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: var(--text);
+  letter-spacing: 0.01em;
+}
+
+.file-chunk-page {
+  font-size: 0.68rem;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+}
+
+.file-chunk-text {
+  font-size: 0.84rem;
+  line-height: 1.65;
+  color: var(--text);
+  white-space: pre-wrap;
+  word-break: break-word;
+  margin: 0;
 }

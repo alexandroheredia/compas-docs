@@ -3,7 +3,7 @@ import { useEffect, useRef, useState } from 'react'
 import type { FormEvent } from 'react'
 import { AppShell } from './AppShell'
 import { ToastStack, useToasts } from './Toast'
-import type { FolderRecord, SearchDocumentItem } from './types'
+import type { FileChunk, FolderRecord, SearchDocumentItem } from './types'
 import {
   basename,
   compactPath,
@@ -24,11 +24,15 @@ export default function MainWindow() {
   const [searchedQuery, setSearchedQuery] = useState('')
   const [status, setStatus] = useState('Loading library...')
   const [busy, setBusy] = useState(false)
+  // File viewer state — null when the dialog is closed.
+  const [expandedResult, setExpandedResult] = useState<SearchDocumentItem | null>(null)
+  const [expandChunks, setExpandChunks] = useState<FileChunk[]>([])
+  const [expandBusy, setExpandBusy] = useState(false)
   const searchInputRef = useRef<HTMLInputElement>(null)
   // Tracks whether we already loaded folders so window-focus refreshes never
   // clobber an in-flight search status with the idle library description.
   const initialLoadDoneRef = useRef(false)
-  const { toasts, push: pushToast, dismiss: dismissToast } = useToasts()
+  const { toasts, exitingIds, push: pushToast, dismiss: dismissToast } = useToasts()
 
   const indexedFolderCount = folders.filter((folder) => folder.lastIndexedAt !== null).length
   const draftQuery = query.trim()
@@ -210,6 +214,28 @@ export default function MainWindow() {
     }
   }
 
+  async function handleExpand(result: SearchDocumentItem) {
+    setExpandedResult(result)
+    setExpandChunks([])
+    if (!hasTauriInvoke) return
+    setExpandBusy(true)
+    try {
+      const chunks = await invoke<FileChunk[]>('read_document_chunks', {
+        absolutePath: result.absolutePath,
+      })
+      setExpandChunks(chunks)
+    } catch (error) {
+      pushToast('error', formatError(error))
+    } finally {
+      setExpandBusy(false)
+    }
+  }
+
+  function handleCloseExpand() {
+    setExpandedResult(null)
+    setExpandChunks([])
+  }
+
   return (
     <AppShell currentView="main">
       <div className="window-main">
@@ -240,6 +266,7 @@ export default function MainWindow() {
                     query={searchedQuery}
                     onOpen={() => void handleOpen(result.absolutePath)}
                     onReveal={() => void handleReveal(result.absolutePath)}
+                    onExpand={() => void handleExpand(result)}
                   />
                 </li>
               ))}
@@ -268,21 +295,23 @@ export default function MainWindow() {
                       : 'Search by topic, file name, or question'
               }
             />
-            {hasSearchResults && !isDraftDirty ? (
-              // Distinct clear control prevents the ambiguous "submit becomes
-              // clear" affordance the old composer had.
-              <button type="button" className="composer-clear" onClick={handleClear} aria-label="Clear search">
-                <CloseGlyph />
+            <div className="composer-actions">
+              {hasSearchResults && !isDraftDirty ? (
+                // Distinct clear control prevents the ambiguous "submit becomes
+                // clear" affordance the old composer had.
+                <button type="button" className="composer-clear" onClick={handleClear} aria-label="Clear search">
+                  <CloseGlyph />
+                </button>
+              ) : null}
+              <button
+                type="submit"
+                className="composer-submit"
+                disabled={submitDisabled}
+                aria-label={busy ? 'Searching' : 'Search'}
+              >
+                <SubmitGlyph />
               </button>
-            ) : null}
-            <button
-              type="submit"
-              className="composer-submit"
-              disabled={submitDisabled}
-              aria-label={busy ? 'Searching' : 'Search'}
-            >
-              <SubmitGlyph />
-            </button>
+            </div>
           </form>
 
           <div className="composer-hint">
@@ -295,7 +324,15 @@ export default function MainWindow() {
           </div>
         </div>
       </div>
-      <ToastStack toasts={toasts} onDismiss={dismissToast} />
+      <ToastStack toasts={toasts} exitingIds={exitingIds} onDismiss={dismissToast} />
+      {expandedResult !== null && (
+        <FileViewerDialog
+          result={expandedResult}
+          chunks={expandChunks}
+          busy={expandBusy}
+          onClose={handleCloseExpand}
+        />
+      )}
     </AppShell>
   )
 }
@@ -305,9 +342,10 @@ type ResultCardProps = {
   query: string
   onOpen: () => void
   onReveal: () => void
+  onExpand: () => void
 }
 
-function ResultCard({ result, query, onOpen, onReveal }: ResultCardProps) {
+function ResultCard({ result, query, onOpen, onReveal, onExpand }: ResultCardProps) {
   const meta = [
     result.folderName,
     result.section !== 'n/a' && result.section !== '(root)' ? result.section : null,
@@ -345,6 +383,9 @@ function ResultCard({ result, query, onOpen, onReveal }: ResultCardProps) {
         </button>
         <button type="button" className="btn btn-sm btn-ghost" onClick={onReveal}>
           Reveal
+        </button>
+        <button type="button" className="btn btn-sm btn-ghost" onClick={onExpand}>
+          Expand
         </button>
       </div>
     </article>
@@ -425,6 +466,142 @@ function EmptyState({ hasTauri, folderCount, indexedCount, searchedQuery, onClea
       <div className="empty-state-actions">
         {primary}
         {secondary}
+      </div>
+    </div>
+  )
+}
+
+type FileViewerDialogProps = {
+  result: SearchDocumentItem
+  chunks: FileChunk[]
+  busy: boolean
+  onClose: () => void
+}
+
+// Renders all indexed chunks for a file in a scrollable modal and auto-scrolls
+// to the chunk that matches the search result's preview text.
+function FileViewerDialog({ result, chunks, busy, onClose }: FileViewerDialogProps) {
+  // Find the chunk whose preview matches the search result — they share the same
+  // value because both come from the same ChunkRow stored in SQLite.
+  const activeIndex = chunks.findIndex((chunk) => chunk.preview === result.preview)
+  const activeRef = useRef<HTMLDivElement>(null)
+
+  // Scroll to the active chunk once the chunks are rendered.
+  useEffect(() => {
+    if (activeRef.current) {
+      activeRef.current.scrollIntoView({ block: 'center', behavior: 'smooth' })
+    }
+  }, [chunks])
+
+  // Close on Escape key.
+  useEffect(() => {
+    function handleKey(event: KeyboardEvent) {
+      if (event.key === 'Escape') {
+        event.preventDefault()
+        onClose()
+      }
+    }
+    window.addEventListener('keydown', handleKey)
+    return () => window.removeEventListener('keydown', handleKey)
+  }, [onClose])
+
+  const section =
+    result.section !== 'n/a' && result.section !== '(root)' ? result.section : null
+  const page = result.page !== 'n/a' ? `Page ${result.page}` : null
+
+  return (
+    // Backdrop — click outside dialog to dismiss.
+    <div className="file-viewer-backdrop" onClick={onClose} role="presentation">
+      <div
+        className="file-viewer-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-label={`File contents: ${result.title}`}
+        // Stop clicks inside the dialog from bubbling to the backdrop.
+        onClick={(event) => event.stopPropagation()}
+      >
+        <div className="file-viewer-header">
+          <div className="file-viewer-title-wrap">
+            <span className="file-viewer-icon" aria-hidden="true">
+              <FileGlyph path={result.absolutePath} />
+            </span>
+            <div className="file-viewer-title-block">
+              <span className="file-viewer-title" title={result.title}>{result.title}</span>
+              <span className="file-viewer-subtitle">
+                {[result.folderName, section, page].filter(Boolean).join(' · ')}
+              </span>
+            </div>
+          </div>
+          <button
+            type="button"
+            className="btn btn-icon btn-ghost file-viewer-close"
+            onClick={onClose}
+            aria-label="Close"
+          >
+            <CloseGlyph />
+          </button>
+        </div>
+
+        <div className="file-viewer-body">
+          {busy && chunks.length === 0 ? (
+            <div className="file-viewer-loading">
+              <span className="status-dot" aria-hidden="true" />
+              Loading…
+            </div>
+          ) : chunks.length === 0 ? (
+            <div className="file-viewer-empty">
+              No indexed content for this file. Re-index the folder to view its contents.
+            </div>
+          ) : (
+            (() => {
+              // Compute which indices should show a heading: only when it
+              // differs from the previous chunk's heading, so a long section
+              // with many chunks shows its heading exactly once.
+              const showHeadingAt = new Set<number>()
+              let lastHeading = ''
+              chunks.forEach((chunk, index) => {
+                const heading = chunk.headingPath.join(' › ')
+                if (heading !== lastHeading) {
+                  showHeadingAt.add(index)
+                  lastHeading = heading
+                }
+              })
+
+              return chunks.map((chunk, index) => {
+                const isActive = index === activeIndex
+                const heading =
+                  chunk.headingPath.length > 0 ? chunk.headingPath.join(' › ') : null
+                const pageLabel =
+                  chunk.pageStart !== null
+                    ? chunk.pageEnd !== null && chunk.pageEnd !== chunk.pageStart
+                      ? `Pages ${chunk.pageStart}–${chunk.pageEnd}`
+                      : `Page ${chunk.pageStart}`
+                    : null
+
+                // Show the heading only when it changes; page labels still
+                // show per-chunk since each chunk may span different pages.
+                const showHeading = heading !== null && showHeadingAt.has(index)
+
+                return (
+                  <div
+                    key={chunk.chunkId}
+                    ref={isActive ? activeRef : undefined}
+                    className={`file-chunk${isActive ? ' is-active' : ''}`}
+                    aria-current={isActive ? 'true' : undefined}
+                  >
+                    {(showHeading || pageLabel !== null) && (
+                      <div className="file-chunk-meta">
+                        {showHeading && <span className="file-chunk-heading">{heading}</span>}
+                        {pageLabel && <span className="file-chunk-page">{pageLabel}</span>}
+                      </div>
+                    )}
+                    <p className="file-chunk-text">{chunk.text}</p>
+                  </div>
+                )
+              })
+            })()
+          )}
+        </div>
       </div>
     </div>
   )

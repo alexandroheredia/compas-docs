@@ -49,3 +49,15 @@ export type IndexProgressEvent = {
   fileStatus?: IndexFileStatus | null
   error?: string | null
 }
+
+/// One chunk of an indexed file, returned by the `read_document_chunks` command.
+/// `preview` is the same value stored on SearchDocumentItem so the file viewer
+/// can locate and scroll to the matched chunk by a simple equality check.
+export type FileChunk = {
+  chunkId: string
+  headingPath: string[]
+  pageStart: number | null
+  pageEnd: number | null
+  text: string
+  preview: string
+}

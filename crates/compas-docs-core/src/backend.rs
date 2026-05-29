@@ -22,6 +22,18 @@ use tracing::{debug, info, warn};
 
 pub use crate::models::{FolderRecord, LibraryStats, SearchDocumentItem};
 
+/// A single text chunk extracted from a file, as stored in the search index.
+/// Returned by [`read_file_chunks`] for in-app document viewing.
+#[derive(Debug, Clone)]
+pub struct FileChunk {
+    pub chunk_id: String,
+    pub heading_path: Vec<String>,
+    pub page_start: Option<usize>,
+    pub page_end: Option<usize>,
+    pub text: String,
+    pub preview: String,
+}
+
 /// Progress events emitted while indexing a folder so UIs can render real progress
 /// instead of a generic spinner. Kept as a small enum so we can extend it without
 /// breaking the Tauri event contract.
@@ -554,6 +566,46 @@ pub fn reveal_in_finder(path: &Path) -> Result<()> {
     } else {
         Err(anyhow!("failed to reveal '{}' in Finder", path.display()))
     }
+}
+
+/// Return all indexed chunks for a file so the UI can render the full document
+/// and scroll to the matched chunk.  Chunks are ordered by their position in
+/// the source file (page_start ASC, then chunk_id for stable tie-breaking).
+pub fn read_file_chunks(absolute_path: &str) -> Result<Vec<FileChunk>> {
+    // Resolve the canonical path so it matches what was stored during indexing.
+    let canonical =
+        std::fs::canonicalize(absolute_path).unwrap_or_else(|_| PathBuf::from(absolute_path));
+    let canonical_str = canonical.to_string_lossy().to_string();
+
+    // Find the indexed folder that contains this file.
+    let folders = list_folders();
+    let folder = folders
+        .iter()
+        .find(|f| canonical_str.starts_with(&f.path) && f.last_indexed_at.is_some())
+        .ok_or_else(|| anyhow!("no indexed folder contains '{}'", canonical_str))?;
+
+    let storage = document_storage_paths(Path::new(&folder.path));
+    if !storage.sqlite_path.exists() {
+        return Err(anyhow!(
+            "folder '{}' index not found; run index first",
+            folder.display_name
+        ));
+    }
+
+    let conn = sqlite::open_database(&storage.sqlite_path)?;
+    let rows = sqlite::chunks_for_file(&conn, &folder.id, &canonical_str)?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| FileChunk {
+            chunk_id: row.chunk_id,
+            heading_path: row.heading_path,
+            page_start: row.page_start,
+            page_end: row.page_end,
+            text: row.text,
+            preview: row.preview,
+        })
+        .collect())
 }
 
 fn to_search_item(folder: &FolderRecord, row: &ChunkRow, score: f32) -> SearchDocumentItem {

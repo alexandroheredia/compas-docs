@@ -1,7 +1,7 @@
 use compas_docs_core::backend::{
     add_folder_with_file_types, default_document_config, index_folder_with_progress, library_stats,
-    list_folders, open_document, remove_folder, reveal_in_finder, search_documents, FolderRecord,
-    IndexProgress, LibraryStats, SearchDocumentItem,
+    list_folders, open_document, read_file_chunks, remove_folder, reveal_in_finder,
+    search_documents, FileChunk, FolderRecord, IndexProgress, LibraryStats, SearchDocumentItem,
 };
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -298,6 +298,40 @@ fn reveal_document_path(path: String) -> Result<(), String> {
     reveal_in_finder(PathBuf::from(path).as_path()).map_err(|err| err.to_string())
 }
 
+/// DTO returned by `read_document_chunks` — one entry per indexed chunk.
+/// `preview` matches `SearchDocumentItem.preview` for the same chunk, so the
+/// frontend can locate the active chunk by a simple equality check.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FileChunkDto {
+    chunk_id: String,
+    heading_path: Vec<String>,
+    page_start: Option<usize>,
+    page_end: Option<usize>,
+    text: String,
+    preview: String,
+}
+
+impl From<FileChunk> for FileChunkDto {
+    fn from(value: FileChunk) -> Self {
+        Self {
+            chunk_id: value.chunk_id,
+            heading_path: value.heading_path,
+            page_start: value.page_start,
+            page_end: value.page_end,
+            text: value.text,
+            preview: value.preview,
+        }
+    }
+}
+
+#[tauri::command]
+fn read_document_chunks(absolute_path: String) -> Result<Vec<FileChunkDto>, String> {
+    read_file_chunks(&absolute_path)
+        .map(|chunks| chunks.into_iter().map(FileChunkDto::from).collect())
+        .map_err(|err| err.to_string())
+}
+
 #[tauri::command]
 fn navigate_main_window(app: tauri::AppHandle, view: AppView) -> Result<(), String> {
     navigate_main_window_to_view(&app, view).map_err(|err| err.to_string())
@@ -403,6 +437,7 @@ pub fn run() {
             search_document_library,
             open_document_path,
             reveal_document_path,
+            read_document_chunks,
             navigate_main_window,
             pick_document_folder,
         ])

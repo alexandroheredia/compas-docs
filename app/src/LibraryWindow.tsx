@@ -43,7 +43,7 @@ export default function LibraryWindow() {
   // though the current UI only allows one at a time.
   const [progressMap, setProgressMap] = useState<Map<string, FolderProgress>>(new Map())
   const folderPathRef = useRef<HTMLInputElement>(null)
-  const { toasts, push: pushToast, dismiss: dismissToast } = useToasts()
+  const { toasts, exitingIds, push: pushToast, dismiss: dismissToast } = useToasts()
 
   const indexedFolderCount = folders.filter((folder) => folder.lastIndexedAt !== null).length
   const pendingFolderCount = folders.length - indexedFolderCount
@@ -409,7 +409,7 @@ export default function LibraryWindow() {
           )}
         </section>
       </div>
-      <ToastStack toasts={toasts} onDismiss={dismissToast} />
+      <ToastStack toasts={toasts} exitingIds={exitingIds} onDismiss={dismissToast} />
     </AppShell>
   )
 }

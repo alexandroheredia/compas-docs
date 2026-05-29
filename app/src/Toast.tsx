@@ -8,23 +8,42 @@ export type Toast = {
   message: string
 }
 
+// How long the toastOut CSS animation runs (must match the value in styles.css).
+const EXIT_MS = 220
+
 // Toasts are intentionally lightweight: ephemeral feedback for completed
 // background work (index finished, folder removed). Persistent state still
 // lives in the in-page status text so screen readers and Playwright assert
 // against a single source of truth.
 export function useToasts(autoDismissMs = 4200) {
   const [toasts, setToasts] = useState<Toast[]>([])
+  // IDs currently playing the exit animation — CSS applies .is-exiting.
+  const [exitingIds, setExitingIds] = useState<Set<number>>(new Set())
   const nextIdRef = useRef(1)
   const timersRef = useRef<Map<number, ReturnType<typeof setTimeout>>>(new Map())
 
-  const dismiss = useCallback((id: number) => {
-    setToasts((current) => current.filter((toast) => toast.id !== id))
-    const timer = timersRef.current.get(id)
-    if (timer) {
-      clearTimeout(timer)
-      timersRef.current.delete(id)
-    }
+  // Hard-remove from state after the exit animation finishes.
+  const remove = useCallback((id: number) => {
+    setToasts((current) => current.filter((t) => t.id !== id))
+    setExitingIds((current) => {
+      const next = new Set(current)
+      next.delete(id)
+      return next
+    })
+    timersRef.current.delete(id)
   }, [])
+
+  // Start exit animation, then remove after EXIT_MS.
+  const dismiss = useCallback((id: number) => {
+    // Cancel any pending auto-dismiss timer for this id.
+    const existing = timersRef.current.get(id)
+    if (existing) {
+      clearTimeout(existing)
+    }
+    setExitingIds((current) => new Set([...current, id]))
+    const exitTimer = setTimeout(() => remove(id), EXIT_MS)
+    timersRef.current.set(id, exitTimer)
+  }, [remove])
 
   const push = useCallback(
     (tone: ToastTone, message: string) => {
@@ -44,15 +63,16 @@ export function useToasts(autoDismissMs = 4200) {
     }
   }, [])
 
-  return { toasts, push, dismiss }
+  return { toasts, exitingIds, push, dismiss }
 }
 
 type ToastStackProps = {
   toasts: Toast[]
+  exitingIds: Set<number>
   onDismiss: (id: number) => void
 }
 
-export function ToastStack({ toasts, onDismiss }: ToastStackProps) {
+export function ToastStack({ toasts, exitingIds, onDismiss }: ToastStackProps) {
   if (toasts.length === 0) {
     return null
   }
@@ -60,7 +80,10 @@ export function ToastStack({ toasts, onDismiss }: ToastStackProps) {
   return (
     <div className="toast-stack" role="status" aria-live="polite">
       {toasts.map((toast) => (
-        <div className={`toast toast-${toast.tone}`} key={toast.id}>
+        <div
+          className={`toast toast-${toast.tone}${exitingIds.has(toast.id) ? ' is-exiting' : ''}`}
+          key={toast.id}
+        >
           <span className="toast-icon" aria-hidden="true" />
           <span>{toast.message}</span>
           <button type="button" aria-label="Dismiss notification" onClick={() => onDismiss(toast.id)}>
