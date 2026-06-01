@@ -4,9 +4,16 @@ import type { UnlistenFn } from '@tauri-apps/api/event'
 import { useEffect, useRef, useState } from 'react'
 import { AppShell } from './AppShell'
 import { ToastStack, useToasts } from './Toast'
-import type { FolderRecord, IndexProgressEvent, RemoveFolderResponse } from './types'
+import type {
+  FolderRecord,
+  IndexProgressEvent,
+  RemoveFolderResponse,
+  WatchFolderResponse,
+  WatchStatusEvent,
+} from './types'
 import {
   INDEX_PROGRESS_EVENT,
+  WATCH_STATUS_EVENT,
   basename,
   formatCount,
   formatError,
@@ -33,6 +40,12 @@ type FolderProgress = {
   finalizing: boolean
 }
 
+type FolderWatchState = {
+  phase: WatchStatusEvent['phase']
+  path: string | null
+  error: string | null
+}
+
 export default function LibraryWindow() {
   const [folders, setFolders] = useState<FolderRecord[]>([])
   const [folderPath, setFolderPath] = useState('')
@@ -42,6 +55,7 @@ export default function LibraryWindow() {
   // Keyed by folder id so concurrent index jobs would render correctly even
   // though the current UI only allows one at a time.
   const [progressMap, setProgressMap] = useState<Map<string, FolderProgress>>(new Map())
+  const [watchStateMap, setWatchStateMap] = useState<Map<string, FolderWatchState>>(new Map())
   const folderPathRef = useRef<HTMLInputElement>(null)
   const { toasts, exitingIds, push: pushToast, dismiss: dismissToast } = useToasts()
 
@@ -93,10 +107,11 @@ export default function LibraryWindow() {
     // Subscribe to streaming progress events. Each emit updates the per-folder
     // progress map; terminal events (completed/failed) clear it.
     if (!hasTauriInvoke) return
-    let unlisten: UnlistenFn | undefined
+    let unlistenProgress: UnlistenFn | undefined
+    let unlistenWatch: UnlistenFn | undefined
     let cancelled = false
     void (async () => {
-      unlisten = await listen<IndexProgressEvent>(INDEX_PROGRESS_EVENT, (event) => {
+      unlistenProgress = await listen<IndexProgressEvent>(INDEX_PROGRESS_EVENT, (event) => {
         if (cancelled) return
         const payload = event.payload
         setProgressMap((current) => {
@@ -114,12 +129,36 @@ export default function LibraryWindow() {
           return next
         })
       })
+
+      unlistenWatch = await listen<WatchStatusEvent>(WATCH_STATUS_EVENT, (event) => {
+        if (cancelled) return
+        const payload = event.payload
+
+        setWatchStateMap((current) => {
+          const next = new Map(current)
+          if (payload.phase === 'stopped') {
+            next.delete(payload.folderId)
+            return next
+          }
+          next.set(payload.folderId, {
+            phase: payload.phase,
+            path: payload.path ?? null,
+            error: payload.error ?? null,
+          })
+          return next
+        })
+
+        if (payload.phase === 'reindex-failed' && payload.error) {
+          pushToast('error', payload.error)
+        }
+      })
     })()
     return () => {
       cancelled = true
-      unlisten?.()
+      unlistenProgress?.()
+      unlistenWatch?.()
     }
-  }, [])
+  }, [pushToast])
 
   function focusPathInput() {
     folderPathRef.current?.focus()
@@ -257,6 +296,44 @@ export default function LibraryWindow() {
     }
   }
 
+  async function handleToggleWatch(folder: FolderRecord) {
+    if (!hasTauriInvoke) return
+
+    const nextEnabled = !folder.watchEnabled
+    setBusyAction({ type: 'index', folderId: folder.id })
+
+    try {
+      const response = await invoke<WatchFolderResponse>('set_document_folder_watch_enabled', {
+        id: folder.id,
+        enabled: nextEnabled,
+      })
+      setFolders((current) => current.map((item) => (item.id === folder.id ? response.folder : item)))
+      setStatus(
+        nextEnabled
+          ? `Watching ${folder.displayName} for file changes.`
+          : `${folder.displayName} is back to manual indexing.`,
+      )
+      pushToast(
+        nextEnabled ? 'success' : 'info',
+        nextEnabled
+          ? `${folder.displayName} will reindex changed files automatically.`
+          : `${folder.displayName} watch disabled.`,
+      )
+      if (!nextEnabled) {
+        setWatchStateMap((current) => {
+          const next = new Map(current)
+          next.delete(folder.id)
+          return next
+        })
+      }
+    } catch (error) {
+      setStatus(formatError(error))
+      pushToast('error', formatError(error))
+    } finally {
+      setBusyAction(null)
+    }
+  }
+
   async function handleRemoveFolder(folder: FolderRecord) {
     if (!hasTauriInvoke) return
     const confirmed = window.confirm(
@@ -391,6 +468,7 @@ export default function LibraryWindow() {
                 const isIndexing = busyAction?.type === 'index' && busyAction.folderId === folder.id
                 const isRemoving = busyAction?.type === 'remove' && busyAction.folderId === folder.id
                 const progress = progressMap.get(folder.id) ?? null
+                const watchState = watchStateMap.get(folder.id) ?? null
                 return (
                   <FolderRow
                     key={folder.id}
@@ -398,9 +476,11 @@ export default function LibraryWindow() {
                     isIndexing={isIndexing}
                     isRemoving={isRemoving}
                     progress={progress}
+                    watchState={watchState}
                     busy={busy}
                     onIndex={() => void handleIndexFolder(folder)}
                     onRemove={() => void handleRemoveFolder(folder)}
+                    onToggleWatch={() => void handleToggleWatch(folder)}
                     onToggleFileType={(fileType) => toggleFolderFileType(folder, fileType)}
                   />
                 )
@@ -419,9 +499,11 @@ type FolderRowProps = {
   isIndexing: boolean
   isRemoving: boolean
   progress: FolderProgress | null
+  watchState: FolderWatchState | null
   busy: boolean
   onIndex: () => void
   onRemove: () => void
+  onToggleWatch: () => void
   onToggleFileType: (fileType: string) => void
 }
 
@@ -430,12 +512,15 @@ function FolderRow({
   isIndexing,
   isRemoving,
   progress,
+  watchState,
   busy,
   onIndex,
   onRemove,
+  onToggleWatch,
   onToggleFileType,
 }: FolderRowProps) {
   const isIndexed = folder.lastIndexedAt !== null
+  const watchButtonLabel = folder.watchEnabled ? 'Disable watch' : 'Enable watch'
 
   let badge: React.ReactNode = isIndexed ? (
     <span className="badge badge-success"><span className="badge-dot" />Ready</span>
@@ -460,6 +545,8 @@ function FolderRow({
         <span>{formatIndexedAt(folder.lastIndexedAt)}</span>
         <span>{folder.watchEnabled ? 'Watch enabled' : 'Manual indexing'}</span>
       </div>
+
+      {watchState ? <WatchStatusRow watchState={watchState} /> : null}
 
       {progress ? <IndexProgressBar progress={progress} /> : null}
 
@@ -489,12 +576,43 @@ function FolderRow({
         <button type="button" className="btn btn-sm btn-secondary" disabled={busy} onClick={onIndex}>
           {isIndexing ? 'Indexing…' : isIndexed ? 'Reindex' : 'Run first index'}
         </button>
+        <button type="button" className="btn btn-sm btn-ghost" disabled={busy} onClick={onToggleWatch}>
+          {watchButtonLabel}
+        </button>
         <button type="button" className="btn btn-sm btn-danger" disabled={busy} onClick={onRemove}>
           {isRemoving ? 'Removing…' : 'Remove'}
         </button>
       </div>
     </article>
   )
+}
+
+function WatchStatusRow({ watchState }: { watchState: FolderWatchState }) {
+  let message = 'Watching for changes…'
+
+  switch (watchState.phase) {
+    case 'change-detected':
+      message = watchState.path ? `Change detected: ${basename(watchState.path)}` : 'Change detected'
+      break
+    case 'remove-detected':
+      message = watchState.path ? `Removed: ${basename(watchState.path)}` : 'File removed'
+      break
+    case 'reindex-started':
+      message = 'Applying file changes…'
+      break
+    case 'reindex-completed':
+      message = 'Background reindex complete.'
+      break
+    case 'reindex-failed':
+      message = watchState.error ?? 'Background reindex failed.'
+      break
+    case 'started':
+    default:
+      message = 'Watching for changes…'
+      break
+  }
+
+  return <p className={`watch-status${watchState.phase === 'reindex-failed' ? ' is-error' : ''}`}>{message}</p>
 }
 
 function IndexProgressBar({ progress }: { progress: FolderProgress }) {

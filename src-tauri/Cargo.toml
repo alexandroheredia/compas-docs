@@ -26,5 +26,5 @@ tauri-plugin-log = "2"
 # Native folder picker so the Library never depends on hand-typed paths.
 tauri-plugin-dialog = "2"
 # Native folder picker bridges a synchronous callback to async tauri commands via oneshot.
-tokio = { version = "1", features = ["sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
 compas-docs-core = { path = "../crates/compas-docs-core" }

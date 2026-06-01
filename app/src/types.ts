@@ -38,7 +38,7 @@ export type StatusTone = 'idle' | 'busy' | 'error'
 
 export type IndexPhase = 'started' | 'file' | 'finalizing' | 'completed' | 'failed'
 
-export type IndexFileStatus = 'indexed' | 'skipped' | 'failed'
+export type IndexFileStatus = 'indexed' | 'unchanged' | 'skipped' | 'failed'
 
 export type IndexProgressEvent = {
   folderId: string
@@ -48,6 +48,26 @@ export type IndexProgressEvent = {
   currentPath?: string | null
   fileStatus?: IndexFileStatus | null
   error?: string | null
+}
+
+export type WatchStatusPhase =
+  | 'started'
+  | 'change-detected'
+  | 'remove-detected'
+  | 'reindex-started'
+  | 'reindex-completed'
+  | 'reindex-failed'
+  | 'stopped'
+
+export type WatchStatusEvent = {
+  folderId: string
+  phase: WatchStatusPhase
+  path?: string | null
+  error?: string | null
+}
+
+export type WatchFolderResponse = {
+  folder: FolderRecord
 }
 
 /// One chunk of an indexed file, returned by the `read_document_chunks` command.

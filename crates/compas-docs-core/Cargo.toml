@@ -13,6 +13,7 @@ dirs = "5"
 fastembed = "5"
 globset = "0.4"
 hnsw_rs = "0.3.4"
+notify = { version = "6", default-features = false, features = ["macos_kqueue"] }
 pdf-extract = "0.10"
 pulldown-cmark = "0.13"
 rusqlite = { version = "0.31", features = ["bundled"] }

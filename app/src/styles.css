@@ -1019,6 +1019,16 @@ textarea:focus-visible,
   gap: 8px;
 }
 
+.watch-status {
+  font-size: 12px;
+  color: var(--text-muted);
+  line-height: 1.45;
+}
+
+.watch-status.is-error {
+  color: var(--danger);
+}
+
 /* File-type chips: tighter, with checkmark glyph instead of native checkbox */
 .file-type-grid {
   display: flex;

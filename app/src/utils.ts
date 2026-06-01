@@ -4,6 +4,7 @@ import type { AppView, StatusTone } from './types'
 export const hasTauriInvoke = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
 export const NAVIGATE_EVENT = 'app:navigate'
 export const INDEX_PROGRESS_EVENT = 'index:progress'
+export const WATCH_STATUS_EVENT = 'watch:status'
 
 export async function openView(view: AppView, currentView?: AppView) {
   if (view === currentView) {

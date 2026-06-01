@@ -1,21 +1,35 @@
 use compas_docs_core::backend::{
     add_folder_with_file_types, default_document_config, index_folder_with_progress, library_stats,
     list_folders, open_document, read_file_chunks, remove_folder, reveal_in_finder,
-    search_documents, FileChunk, FolderRecord, IndexProgress, LibraryStats, SearchDocumentItem,
+    search_documents, set_folder_watch_enabled, watch_document_folder, FileChunk, FolderRecord,
+    IndexProgress, LibraryStats, SearchDocumentItem, WatchEventKind, WatchStatus,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tauri::menu::{MenuBuilder, SubmenuBuilder};
 use tauri::{Emitter, Manager};
 use tauri_plugin_dialog::DialogExt;
+use tokio::sync::{watch, Mutex};
 
 const MENU_OPEN_LIBRARY: &str = "open-library";
 const MENU_OPEN_STATS: &str = "open-stats";
 const MENU_OPEN_SEARCH: &str = "open-search";
 const NAVIGATE_EVENT: &str = "app:navigate";
 const INDEX_PROGRESS_EVENT: &str = "index:progress";
+const WATCH_STATUS_EVENT: &str = "watch:status";
 const WINDOW_MAIN: &str = "main";
+
+#[derive(Default)]
+struct WatchManagerState {
+    tasks: Mutex<HashMap<String, WatchHandle>>,
+}
+
+struct WatchHandle {
+    stop_tx: watch::Sender<bool>,
+    task: tokio::task::JoinHandle<()>,
+}
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -77,6 +91,12 @@ impl From<SearchDocumentItem> for SearchDocumentItemDto {
 #[serde(rename_all = "camelCase")]
 struct RemoveFolderResponse {
     removed: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WatchFolderResponse {
+    folder: FolderRecordDto,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -153,6 +173,62 @@ struct LibraryStatsDto {
     last_indexed_at: Option<u64>,
 }
 
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct WatchStatusDto {
+    folder_id: String,
+    phase: String,
+    path: Option<String>,
+    error: Option<String>,
+}
+
+impl WatchStatusDto {
+    fn from_status(folder_id: &str, status: WatchStatus) -> Self {
+        match status {
+            WatchStatus::Started => Self {
+                folder_id: folder_id.to_string(),
+                phase: "started".into(),
+                path: None,
+                error: None,
+            },
+            WatchStatus::ChangeDetected { path, kind } => Self {
+                folder_id: folder_id.to_string(),
+                phase: match kind {
+                    WatchEventKind::Changed => "change-detected",
+                    WatchEventKind::Removed => "remove-detected",
+                }
+                .into(),
+                path: Some(path),
+                error: None,
+            },
+            WatchStatus::ReindexStarted => Self {
+                folder_id: folder_id.to_string(),
+                phase: "reindex-started".into(),
+                path: None,
+                error: None,
+            },
+            WatchStatus::ReindexCompleted => Self {
+                folder_id: folder_id.to_string(),
+                phase: "reindex-completed".into(),
+                path: None,
+                error: None,
+            },
+            WatchStatus::ReindexFailed { error } => Self {
+                folder_id: folder_id.to_string(),
+                phase: "reindex-failed".into(),
+                path: None,
+                error: Some(error),
+            },
+            WatchStatus::Stopped => Self {
+                folder_id: folder_id.to_string(),
+                phase: "stopped".into(),
+                path: None,
+                error: None,
+            },
+        }
+    }
+}
+
 impl From<LibraryStats> for LibraryStatsDto {
     fn from(value: LibraryStats) -> Self {
         Self {
@@ -217,7 +293,7 @@ async fn index_document_folder(
     let app_for_progress = app.clone();
     let folder_id_for_progress = folder_id.clone();
     let progress_callback: compas_docs_core::backend::ProgressCallback =
-        Box::new(move |event: IndexProgress| {
+        Arc::new(move |event: IndexProgress| {
             let payload = IndexProgressDto::from_event(&folder_id_for_progress, event);
             if let Err(err) = app_for_progress.emit(INDEX_PROGRESS_EVENT, payload) {
                 log::warn!("failed to emit index progress: {err}");
@@ -237,6 +313,26 @@ async fn index_document_folder(
     }
 
     result
+}
+
+#[tauri::command]
+async fn set_document_folder_watch_enabled(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, WatchManagerState>,
+    id: String,
+    enabled: bool,
+) -> Result<WatchFolderResponse, String> {
+    let folder = set_folder_watch_enabled(&id, enabled).map_err(|err| err.to_string())?;
+
+    if enabled {
+        ensure_folder_watch(&app, &state, &folder).await?;
+    } else {
+        stop_folder_watch(&state, &id).await;
+    }
+
+    Ok(WatchFolderResponse {
+        folder: FolderRecordDto::from(folder),
+    })
 }
 
 #[tauri::command]
@@ -394,9 +490,119 @@ fn build_app_menu<R: tauri::Runtime>(
         .build()
 }
 
+async fn ensure_folder_watch(
+    app: &tauri::AppHandle,
+    state: &tauri::State<'_, WatchManagerState>,
+    folder: &FolderRecord,
+) -> Result<(), String> {
+    let mut tasks = state.tasks.lock().await;
+    if tasks.contains_key(&folder.id) {
+        return Ok(());
+    }
+
+    let (stop_tx, stop_rx) = watch::channel(false);
+    let folder_id = folder.id.clone();
+    let folder_path = PathBuf::from(&folder.path);
+    let app_for_task = app.clone();
+    let folder_id_for_progress = folder_id.clone();
+    let progress_callback: compas_docs_core::backend::ProgressCallback =
+        Arc::new(move |event: IndexProgress| {
+            let payload = IndexProgressDto::from_event(&folder_id_for_progress, event);
+            if let Err(err) = app_for_task.emit(INDEX_PROGRESS_EVENT, payload) {
+                log::warn!("failed to emit watch index progress: {err}");
+            }
+        });
+
+    let app_for_status = app.clone();
+    let folder_id_for_status = folder_id.clone();
+    let app_for_terminal = app.clone();
+    let folder_id_for_terminal = folder_id.clone();
+    let status_callback: compas_docs_core::backend::WatchStatusCallback =
+        Arc::new(move |status: WatchStatus| {
+            match &status {
+                WatchStatus::ReindexCompleted => {
+                    let terminal = IndexProgressDto::terminal(&folder_id_for_terminal, true);
+                    if let Err(err) = app_for_terminal.emit(INDEX_PROGRESS_EVENT, terminal) {
+                        log::warn!("failed to emit watch terminal progress: {err}");
+                    }
+                }
+                WatchStatus::ReindexFailed { .. } => {
+                    let terminal = IndexProgressDto::terminal(&folder_id_for_terminal, false);
+                    if let Err(err) = app_for_terminal.emit(INDEX_PROGRESS_EVENT, terminal) {
+                        log::warn!("failed to emit watch failed terminal progress: {err}");
+                    }
+                }
+                _ => {}
+            }
+
+            let payload = WatchStatusDto::from_status(&folder_id_for_status, status);
+            if let Err(err) = app_for_status.emit(WATCH_STATUS_EVENT, payload) {
+                log::warn!("failed to emit watch status: {err}");
+            }
+        });
+
+    let app_for_error = app.clone();
+    let task = tokio::spawn(async move {
+        let config = default_document_config(&folder_path);
+        if let Err(err) = watch_document_folder(
+            folder_id.clone(),
+            config,
+            Some(progress_callback),
+            status_callback,
+            stop_rx,
+        )
+        .await
+        {
+            let payload = WatchStatusDto {
+                folder_id,
+                phase: "reindex-failed".into(),
+                path: None,
+                error: Some(err.to_string()),
+            };
+            if let Err(emit_err) = app_for_error.emit(WATCH_STATUS_EVENT, payload) {
+                log::warn!("failed to emit watch task error: {emit_err}");
+            }
+        }
+    });
+
+    tasks.insert(folder.id.clone(), WatchHandle { stop_tx, task });
+    Ok(())
+}
+
+async fn stop_folder_watch(state: &tauri::State<'_, WatchManagerState>, id: &str) {
+    let handle = {
+        let mut tasks = state.tasks.lock().await;
+        tasks.remove(id)
+    };
+
+    if let Some(handle) = handle {
+        let _ = handle.stop_tx.send(true);
+        let _ = handle.task.await;
+    }
+}
+
+async fn restore_enabled_folder_watches(
+    app: &tauri::AppHandle,
+    state: &tauri::State<'_, WatchManagerState>,
+) {
+    for folder in list_folders()
+        .into_iter()
+        .filter(|folder| folder.watch_enabled)
+    {
+        if let Err(err) = ensure_folder_watch(app, state, &folder).await {
+            log::error!(
+                "failed to restore watch for {}: {}",
+                folder.display_name,
+                err
+            );
+        }
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .manage(WatchManagerState::default())
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             if cfg!(debug_assertions) {
@@ -408,6 +614,10 @@ pub fn run() {
             }
             let menu = build_app_menu(&app.handle())?;
             app.set_menu(menu)?;
+            tauri::async_runtime::block_on(async {
+                let state = app.state::<WatchManagerState>();
+                restore_enabled_folder_watches(&app.handle(), &state).await;
+            });
             Ok(())
         })
         .on_menu_event(|app, event| match event.id().0.as_str() {
@@ -432,6 +642,7 @@ pub fn run() {
             list_document_folders,
             add_document_folder,
             index_document_folder,
+            set_document_folder_watch_enabled,
             remove_document_folder,
             get_document_library_stats,
             search_document_library,

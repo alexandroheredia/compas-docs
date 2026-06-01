@@ -17,10 +17,14 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 pub use crate::models::{FolderRecord, LibraryStats, SearchDocumentItem};
+
+const WATCH_DEBOUNCE_MS: u64 = 900;
 
 /// A single text chunk extracted from a file, as stored in the search index.
 /// Returned by [`read_file_chunks`] for in-app document viewing.
@@ -74,7 +78,25 @@ impl IndexFileStatus {
 
 /// Type-erased progress callback. Synchronous because indexing already runs on a
 /// dedicated task and the callback only needs to forward events (e.g. via Tauri emit).
-pub type ProgressCallback = Box<dyn Fn(IndexProgress) + Send + Sync>;
+pub type ProgressCallback = Arc<dyn Fn(IndexProgress) + Send + Sync>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatchEventKind {
+    Changed,
+    Removed,
+}
+
+#[derive(Debug, Clone)]
+pub enum WatchStatus {
+    Started,
+    ChangeDetected { path: String, kind: WatchEventKind },
+    ReindexStarted,
+    ReindexCompleted,
+    ReindexFailed { error: String },
+    Stopped,
+}
+
+pub type WatchStatusCallback = Arc<dyn Fn(WatchStatus) + Send + Sync>;
 
 pub fn default_document_config(path: &Path) -> AppConfig {
     let storage = document_storage_paths(path);
@@ -216,7 +238,12 @@ pub fn add_folder_with_file_types(
             .iter()
             .find(|folder| folder.id == id)
             .and_then(|folder| folder.last_indexed_at),
-        watch_enabled: false,
+        watch_enabled: registry
+            .folders
+            .iter()
+            .find(|folder| folder.id == id)
+            .map(|folder| folder.watch_enabled)
+            .unwrap_or(false),
     };
 
     if let Some(existing) = registry.folders.iter_mut().find(|folder| folder.id == id) {
@@ -230,6 +257,21 @@ pub fn add_folder_with_file_types(
 
     save_folder_registry(&registry)?;
     Ok(record)
+}
+
+pub fn set_folder_watch_enabled(id: &str, enabled: bool) -> Result<FolderRecord> {
+    let mut registry = load_folder_registry();
+    let folder = registry
+        .folders
+        .iter_mut()
+        .find(|folder| folder.id == id)
+        .ok_or_else(|| anyhow!("folder '{}' not found", id))?;
+
+    folder.file_types = normalize_or_default_folder_file_types(&folder.file_types);
+    folder.watch_enabled = enabled;
+    let updated = folder.clone();
+    save_folder_registry(&registry)?;
+    Ok(updated)
 }
 
 pub fn list_folders() -> Vec<FolderRecord> {
@@ -473,6 +515,432 @@ pub async fn index_folder_with_progress(
     }
     save_folder_registry(&registry)?;
     Ok(updated)
+}
+
+pub async fn apply_document_changes(
+    folder_id: &str,
+    config: AppConfig,
+    changed_paths: &[PathBuf],
+    removed_paths: &[PathBuf],
+    progress: Option<ProgressCallback>,
+) -> Result<FolderRecord> {
+    let emit = |event: IndexProgress| {
+        if let Some(callback) = progress.as_ref() {
+            callback(event);
+        }
+    };
+
+    let folders = list_folders();
+    let folder = folders
+        .into_iter()
+        .find(|folder| folder.id == folder_id)
+        .ok_or_else(|| anyhow!("folder '{}' not found", folder_id))?;
+
+    let canonical = std::fs::canonicalize(&folder.path)?;
+    let storage = document_storage_paths(&canonical);
+    std::fs::create_dir_all(&storage.root)?;
+    std::fs::create_dir_all(&storage.store_path)?;
+
+    let normalized_file_types = normalize_or_default_folder_file_types(&folder.file_types);
+    let mut config = config;
+    config.repo.path = canonical.to_string_lossy().to_string();
+    normalize_document_storage(&mut config);
+
+    let mut conn = sqlite::open_database(&storage.sqlite_path)?;
+    let embedder = build_embedder(&config.embedder)?;
+    let extractors = DocumentExtractorRegistry::new();
+
+    let mut manifest = load_manifest(&storage.manifest_path);
+    let mut changed_set = HashSet::new();
+    let mut changed_files = Vec::new();
+    for path in changed_paths {
+        let canonical_path = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
+        if !canonical_path.starts_with(&canonical) {
+            continue;
+        }
+        let file_str = canonical_path.to_string_lossy().to_string();
+        if !changed_set.insert(file_str.clone()) {
+            continue;
+        }
+        changed_files.push(canonical_path);
+    }
+
+    let mut removed_set = HashSet::new();
+    let mut removed_files = Vec::new();
+    for path in removed_paths {
+        let canonical_path = canonical.join(path.strip_prefix(&canonical).unwrap_or(path));
+        let file_str = canonical_path.to_string_lossy().to_string();
+        if !file_str.starts_with(&canonical.to_string_lossy().to_string()) {
+            continue;
+        }
+        if !removed_set.insert(file_str.clone()) {
+            continue;
+        }
+        removed_files.push(canonical_path);
+    }
+
+    let total_files = changed_files.len() + removed_files.len();
+    emit(IndexProgress::Started { total_files });
+
+    let mut processed_files = 0usize;
+    let mut failed_files = 0usize;
+
+    for path in removed_files {
+        delete_manifested_path(&conn, &folder.id, &mut manifest, &path)?;
+        let file_str = path.to_string_lossy().to_string();
+        processed_files += 1;
+        emit(IndexProgress::File {
+            processed_files,
+            total_files,
+            path: file_str,
+            status: IndexFileStatus::Skipped,
+        });
+    }
+
+    for file in changed_files {
+        if file.is_dir() {
+            continue;
+        }
+        let file_str = file.to_string_lossy().to_string();
+        let relative = file.strip_prefix(&canonical).unwrap_or(file.as_path());
+        let should_track = should_include(relative, &config.repo.include, &config.repo.exclude)
+            && lowercase_extension(&file)
+                .map(|extension| {
+                    normalized_file_types
+                        .iter()
+                        .any(|file_type| file_type == &extension)
+                })
+                .unwrap_or(false);
+
+        if !should_track {
+            sqlite::delete_file(&conn, &folder.id, &file_str)?;
+            manifest.remove(&file_str);
+            processed_files += 1;
+            emit(IndexProgress::File {
+                processed_files,
+                total_files,
+                path: file_str,
+                status: IndexFileStatus::Skipped,
+            });
+            continue;
+        }
+
+        let bytes = match std::fs::read(&file) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                sqlite::delete_file(&conn, &folder.id, &file_str)?;
+                manifest.remove(&file_str);
+                processed_files += 1;
+                emit(IndexProgress::File {
+                    processed_files,
+                    total_files,
+                    path: file_str,
+                    status: IndexFileStatus::Skipped,
+                });
+                continue;
+            }
+            Err(err) => return Err(err.into()),
+        };
+
+        let hash = hash_bytes(&bytes);
+        if manifest.get(&file_str) == Some(&hash) {
+            processed_files += 1;
+            emit(IndexProgress::File {
+                processed_files,
+                total_files,
+                path: file_str,
+                status: IndexFileStatus::Unchanged,
+            });
+            continue;
+        }
+
+        let extracted = match extractors.extract(&file, &bytes) {
+            Ok(extracted) => extracted,
+            Err(err) => {
+                warn!(path = %file.display(), error = %err, "skipping unreadable document during watcher indexing");
+                sqlite::delete_file(&conn, &folder.id, &file_str)?;
+                manifest.remove(&file_str);
+                failed_files += 1;
+                processed_files += 1;
+                emit(IndexProgress::File {
+                    processed_files,
+                    total_files,
+                    path: file_str,
+                    status: IndexFileStatus::Failed,
+                });
+                continue;
+            }
+        };
+
+        let chunks = chunk_document(&extracted);
+        if chunks.is_empty() {
+            sqlite::delete_file(&conn, &folder.id, &file_str)?;
+            manifest.insert(file_str.clone(), hash);
+            processed_files += 1;
+            emit(IndexProgress::File {
+                processed_files,
+                total_files,
+                path: file_str,
+                status: IndexFileStatus::Skipped,
+            });
+            continue;
+        }
+
+        let texts: Vec<String> = chunks
+            .iter()
+            .map(|chunk| chunk.enriched_text.clone())
+            .collect();
+        let embeddings = match embedder.embed_batch(&texts, EmbedMode::Document).await {
+            Ok(embeddings) => embeddings,
+            Err(err) => {
+                warn!(path = %file.display(), error = %err, "skipping document after embedding failure in watcher indexing");
+                sqlite::delete_file(&conn, &folder.id, &file_str)?;
+                manifest.remove(&file_str);
+                failed_files += 1;
+                processed_files += 1;
+                emit(IndexProgress::File {
+                    processed_files,
+                    total_files,
+                    path: file_str,
+                    status: IndexFileStatus::Failed,
+                });
+                continue;
+            }
+        };
+
+        sqlite::replace_file_chunks(
+            &mut conn,
+            &folder.id,
+            &canonical,
+            &folder.display_name,
+            &file_str,
+            &chunks,
+            &embeddings,
+        )?;
+        manifest.insert(file_str.clone(), hash);
+        processed_files += 1;
+        emit(IndexProgress::File {
+            processed_files,
+            total_files,
+            path: file_str,
+            status: IndexFileStatus::Indexed,
+        });
+    }
+
+    emit(IndexProgress::Finalizing { total_files });
+    let rows = sqlite::list_chunks_for_folder(&conn, &folder.id)?;
+    exact::rebuild_index(&storage.tantivy_dir, &rows)?;
+    vector::rebuild_index(&storage.hnsw_dir, &rows)?;
+    save_manifest(&storage.manifest_path, &manifest)?;
+    info!(folder_id = %folder.id, chunk_count = rows.len(), failed_files, changed_files = processed_files, "applied watched document changes");
+
+    let mut updated = folder.clone();
+    updated.last_indexed_at = Some(now_unix());
+    let mut registry = load_folder_registry();
+    if let Some(existing) = registry
+        .folders
+        .iter_mut()
+        .find(|record| record.id == updated.id)
+    {
+        *existing = updated.clone();
+    }
+    save_folder_registry(&registry)?;
+    Ok(updated)
+}
+
+fn collect_pending_document_changes(
+    folder: &FolderRecord,
+    config: &AppConfig,
+) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
+    let canonical = std::fs::canonicalize(&folder.path)?;
+    let storage = document_storage_paths(&canonical);
+    let manifest = load_manifest(&storage.manifest_path);
+    let current_files = collect_document_files(
+        &canonical,
+        &config.repo.include,
+        &config.repo.exclude,
+        &folder.file_types,
+    )?;
+
+    let current_paths: HashSet<String> = current_files
+        .iter()
+        .map(|path| path.to_string_lossy().to_string())
+        .collect();
+    let removed_paths = manifest
+        .keys()
+        .filter(|path| !current_paths.contains(*path))
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+
+    let mut changed_paths = Vec::new();
+    for file in current_files {
+        let bytes = std::fs::read(&file)?;
+        let hash = hash_bytes(&bytes);
+        let file_str = file.to_string_lossy().to_string();
+        if manifest.get(&file_str) != Some(&hash) {
+            changed_paths.push(file);
+        }
+    }
+
+    Ok((changed_paths, removed_paths))
+}
+
+fn delete_manifested_path(
+    conn: &rusqlite::Connection,
+    folder_id: &str,
+    manifest: &mut HashMap<String, String>,
+    path: &Path,
+) -> Result<()> {
+    let path_str = path.to_string_lossy().to_string();
+    let prefix = format!("{}/", path_str.trim_end_matches('/'));
+    let matches = manifest
+        .keys()
+        .filter(|existing| *existing == &path_str || existing.starts_with(&prefix))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    if matches.is_empty() {
+        sqlite::delete_file(conn, folder_id, &path_str)?;
+        manifest.remove(&path_str);
+        return Ok(());
+    }
+
+    for matched in matches {
+        sqlite::delete_file(conn, folder_id, &matched)?;
+        manifest.remove(&matched);
+    }
+    Ok(())
+}
+
+pub async fn watch_document_folder(
+    folder_id: String,
+    config: AppConfig,
+    progress: Option<ProgressCallback>,
+    status_callback: WatchStatusCallback,
+    mut stop_rx: tokio::sync::watch::Receiver<bool>,
+) -> Result<()> {
+    use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
+
+    let folder = list_folders()
+        .into_iter()
+        .find(|folder| folder.id == folder_id)
+        .ok_or_else(|| anyhow!("folder '{}' not found", folder_id))?;
+    let watch_path = std::fs::canonicalize(&folder.path)?;
+    let (tx, mut rx) = mpsc::channel(1024);
+    let callback_tx = tx.clone();
+
+    let mut watcher = RecommendedWatcher::new(
+        move |res: Result<Event, notify::Error>| {
+            let Ok(event) = res else {
+                return;
+            };
+            let kind = match event.kind {
+                notify::EventKind::Modify(_) | notify::EventKind::Create(_) => {
+                    WatchEventKind::Changed
+                }
+                notify::EventKind::Remove(_) => WatchEventKind::Removed,
+                _ => return,
+            };
+            for path in event.paths {
+                let _ = callback_tx.blocking_send((path.to_string_lossy().to_string(), kind));
+            }
+        },
+        Config::default(),
+    )?;
+    watcher.watch(&watch_path, RecursiveMode::Recursive)?;
+    status_callback(WatchStatus::Started);
+
+    let (startup_changed_paths, startup_removed_paths) =
+        collect_pending_document_changes(&folder, &config)?;
+    if !startup_changed_paths.is_empty() || !startup_removed_paths.is_empty() {
+        status_callback(WatchStatus::ReindexStarted);
+        match apply_document_changes(
+            &folder.id,
+            config.clone(),
+            &startup_changed_paths,
+            &startup_removed_paths,
+            progress.clone(),
+        )
+        .await
+        {
+            Ok(_) => status_callback(WatchStatus::ReindexCompleted),
+            Err(err) => status_callback(WatchStatus::ReindexFailed {
+                error: err.to_string(),
+            }),
+        }
+    }
+
+    let mut pending = HashMap::<String, WatchEventKind>::new();
+
+    loop {
+        tokio::select! {
+            changed = stop_rx.changed() => {
+                if changed.is_err() || *stop_rx.borrow() {
+                    break;
+                }
+            }
+            maybe_event = rx.recv() => {
+                let Some((path, kind)) = maybe_event else {
+                    break;
+                };
+                status_callback(WatchStatus::ChangeDetected {
+                    path: path.clone(),
+                    kind,
+                });
+                pending.insert(path, kind);
+
+                loop {
+                    let sleep = tokio::time::sleep(std::time::Duration::from_millis(WATCH_DEBOUNCE_MS));
+                    tokio::pin!(sleep);
+                    tokio::select! {
+                        changed = stop_rx.changed() => {
+                            if changed.is_err() || *stop_rx.borrow() {
+                                status_callback(WatchStatus::Stopped);
+                                return Ok(());
+                            }
+                        }
+                        maybe_event = rx.recv() => {
+                            match maybe_event {
+                                Some((path, kind)) => {
+                                    status_callback(WatchStatus::ChangeDetected {
+                                        path: path.clone(),
+                                        kind,
+                                    });
+                                    pending.insert(path, kind);
+                                    continue;
+                                }
+                                None => break,
+                            }
+                        }
+                        _ = &mut sleep => break,
+                    }
+                }
+
+                let batch = pending.drain().collect::<Vec<_>>();
+                if batch.is_empty() {
+                    continue;
+                }
+
+                let mut changed_paths = Vec::new();
+                let mut removed_paths = Vec::new();
+                for (path, kind) in batch {
+                    match kind {
+                        WatchEventKind::Changed => changed_paths.push(PathBuf::from(path)),
+                        WatchEventKind::Removed => removed_paths.push(PathBuf::from(path)),
+                    }
+                }
+
+                status_callback(WatchStatus::ReindexStarted);
+                match apply_document_changes(&folder.id, config.clone(), &changed_paths, &removed_paths, progress.clone()).await {
+                    Ok(_) => status_callback(WatchStatus::ReindexCompleted),
+                    Err(err) => status_callback(WatchStatus::ReindexFailed { error: err.to_string() }),
+                }
+            }
+        }
+    }
+
+    status_callback(WatchStatus::Stopped);
+    Ok(())
 }
 
 pub async fn search_documents(
